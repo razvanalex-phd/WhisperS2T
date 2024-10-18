@@ -2,13 +2,12 @@
 
 import os
 import re
-import requests
-
-import huggingface_hub
 from typing import List, Optional
 
-from ... import CACHE_DIR
+import huggingface_hub
+import requests
 
+from ... import CACHE_DIR
 
 os.makedirs(f"{CACHE_DIR}/models", exist_ok=True)
 
