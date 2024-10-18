@@ -14,378 +14,366 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-
+import logging
+import os
+from collections import defaultdict
+from functools import lru_cache
 from pathlib import Path
+from subprocess import CalledProcessError, run
+from typing import Dict, Iterable, List, Optional, TextIO, Tuple, Union
 
+import kaldialign
 import numpy as np
+import soundfile
 import torch
+import torch.nn.functional as F
 
-import tensorrt_llm
-from tensorrt_llm._utils import str_dtype_to_np
-from tensorrt_llm.quantization import QuantMode
+Pathlike = Union[str, Path]
 
-
-def fromfile(dir_path, name, shape=None, dtype=None):
-    p = dir_path + '/' + name
-    if Path(p).exists():
-        t = np.fromfile(p, dtype=dtype)
-        if shape is not None:
-            t = t.reshape(shape)
-        return t
-    return None
+SAMPLE_RATE = 16000
+N_FFT = 400
+HOP_LENGTH = 160
+CHUNK_LENGTH = 30
+N_SAMPLES = CHUNK_LENGTH * SAMPLE_RATE  # 480000 samples in a 30-second chunk
 
 
 def sinusoids(length, channels, max_timescale=10000):
     """Returns sinusoids for positional embedding"""
     assert channels % 2 == 0
     log_timescale_increment = np.log(max_timescale) / (channels // 2 - 1)
-    inv_timescales = torch.exp(-log_timescale_increment *
-                               torch.arange(channels // 2))
-    scaled_time = torch.arange(length)[:, np.newaxis] * inv_timescales[
-        np.newaxis, :]
+    inv_timescales = torch.exp(-log_timescale_increment * torch.arange(channels // 2))
+    scaled_time = torch.arange(length)[:, np.newaxis] * inv_timescales[np.newaxis, :]
     return torch.cat([torch.sin(scaled_time), torch.cos(scaled_time)], dim=1)
 
 
-def trans_weight(weight):
-    return np.ascontiguousarray(weight)
+def load_audio(file: str, sr: int = SAMPLE_RATE):
+    """
+    Open an audio file and read as mono waveform, resampling as necessary
+
+    Parameters
+    ----------
+    file: str
+        The audio file to open
+
+    sr: int
+        The sample rate to resample the audio if necessary
+
+    Returns
+    -------
+    A NumPy array containing the audio waveform, in float32 dtype.
+    """
+
+    # This launches a subprocess to decode audio while down-mixing
+    # and resampling as necessary.  Requires the ffmpeg CLI in PATH.
+    # fmt: off
+    cmd = [
+        "ffmpeg", "-nostdin", "-threads", "0", "-i", file, "-f", "s16le", "-ac",
+        "1", "-acodec", "pcm_s16le", "-ar",
+        str(sr), "-"
+    ]
+    # fmt: on
+    try:
+        out = run(cmd, capture_output=True, check=True).stdout
+    except CalledProcessError as e:
+        raise RuntimeError(f"Failed to load audio: {e.stderr.decode()}") from e
+
+    return np.frombuffer(out, np.int16).flatten().astype(np.float32) / 32768.0
 
 
-def load_encoder_weight(tensorrt_llm_whisper, model_metadata: dict,
-                        model_params: dict, n_layer: int):
-    tensorrt_llm.logger.info('Loading encoder weights from PT...')
-
-    quant_mode = getattr(tensorrt_llm_whisper, 'quant_mode', QuantMode(0))
-    if quant_mode.is_int8_weight_only():
-        plugin_weight_only_quant_type = torch.int8
-    elif quant_mode.is_int4_weight_only():
-        plugin_weight_only_quant_type = torch.quint4x2
-
-    use_weight_only = quant_mode.is_weight_only()
-
-    tensorrt_llm_whisper.positional_embedding.value = sinusoids(
-        model_metadata['n_audio_ctx'], model_metadata['n_audio_state']).numpy()
-
-    tensorrt_llm_whisper.conv1.weight.value = torch.unsqueeze(
-        model_params['encoder.conv1.weight'], -1).numpy()
-    tensorrt_llm_whisper.conv1.bias.value = model_params[
-        'encoder.conv1.bias'].numpy()
-    tensorrt_llm_whisper.conv2.weight.value = torch.unsqueeze(
-        model_params['encoder.conv2.weight'], -1).numpy()
-    tensorrt_llm_whisper.conv2.bias.value = model_params[
-        'encoder.conv2.bias'].numpy()
-
-    for i in range(n_layer):
-        tensorrt_llm_whisper.encoder_layers[
-            i].attention_layernorm.weight.value = model_params[
-                'encoder.blocks.' + str(i) + '.attn_ln.weight'].numpy()
-        tensorrt_llm_whisper.encoder_layers[
-            i].attention_layernorm.bias.value = model_params[
-                'encoder.blocks.' + str(i) + '.attn_ln.bias'].numpy()
-
-        t = torch.cat([
-            model_params['encoder.blocks.' + str(i) + '.attn.query.weight'],
-            model_params['encoder.blocks.' + str(i) + '.attn.key.weight'],
-            model_params['encoder.blocks.' + str(i) + '.attn.value.weight']
-        ],
-                      dim=0).numpy()
-
-        if t is not None:
-            dst = tensorrt_llm_whisper.encoder_layers[i].attention.qkv.weight
-            if use_weight_only:
-                processed_torch_weights, torch_weight_scales = torch.ops.trtllm.symmetric_quantize_last_axis_of_batched_matrix(
-                    torch.tensor(np.ascontiguousarray(t.transpose(1, 0))),
-                    plugin_weight_only_quant_type)
-                dst.value = processed_torch_weights.numpy()
-                scales = tensorrt_llm_whisper.encoder_layers[
-                    i].attention.qkv.per_channel_scale
-                scales.value = torch_weight_scales.numpy()
-            else:
-                dst.value = t
-
-        bias_shape = model_params['encoder.blocks.' + str(i) +
-                                  '.attn.query.bias'].shape
-        dtype = model_params['encoder.blocks.' + str(i) +
-                             '.attn.query.bias'].dtype
-        fused_bias = torch.cat([
-            model_params['encoder.blocks.' + str(i) + '.attn.query.bias'],
-            torch.zeros([*bias_shape], dtype=dtype),
-            model_params['encoder.blocks.' + str(i) + '.attn.value.bias']
-        ],
-                               dim=0).numpy()
-        tensorrt_llm_whisper.encoder_layers[
-            i].attention.qkv.bias.value = fused_bias
-
-        t = trans_weight(model_params['encoder.blocks.' + str(i) +
-                                      '.attn.out.weight'].numpy())
-        if t is not None:
-            dst = tensorrt_llm_whisper.encoder_layers[i].attention.dense.weight
-            if use_weight_only:
-                processed_torch_weights, torch_weight_scales = torch.ops.trtllm.symmetric_quantize_last_axis_of_batched_matrix(
-                    torch.tensor(np.ascontiguousarray(t.transpose(1, 0))),
-                    plugin_weight_only_quant_type)
-                dst.value = processed_torch_weights.numpy()
-                scales = tensorrt_llm_whisper.encoder_layers[
-                    i].attention.dense.per_channel_scale
-                scales.value = torch_weight_scales.numpy()
-            else:
-                dst.value = t
-        tensorrt_llm_whisper.encoder_layers[
-            i].attention.dense.bias.value = trans_weight(
-                model_params['encoder.blocks.' + str(i) +
-                             '.attn.out.bias'].numpy())
-
-        tensorrt_llm_whisper.encoder_layers[
-            i].mlp_layernorm.weight.value = model_params[
-                'encoder.blocks.' + str(i) + '.mlp_ln.weight'].numpy()
-        tensorrt_llm_whisper.encoder_layers[
-            i].mlp_layernorm.bias.value = model_params['encoder.blocks.' +
-                                                       str(i) +
-                                                       '.mlp_ln.bias'].numpy()
-
-        t = trans_weight(model_params['encoder.blocks.' + str(i) +
-                                      '.mlp.0.weight'].numpy())
-        if t is not None:
-            dst = tensorrt_llm_whisper.encoder_layers[i].mlp.fc.weight
-            if use_weight_only:
-                processed_torch_weights, torch_weight_scales = torch.ops.trtllm.symmetric_quantize_last_axis_of_batched_matrix(
-                    torch.tensor(np.ascontiguousarray(t.transpose(1, 0))),
-                    plugin_weight_only_quant_type)
-                dst.value = processed_torch_weights.numpy()
-                scales = tensorrt_llm_whisper.encoder_layers[
-                    i].mlp.fc.per_channel_scale
-                scales.value = torch_weight_scales.numpy()
-            else:
-                dst.value = t
-        tensorrt_llm_whisper.encoder_layers[i].mlp.fc.bias.value = trans_weight(
-            model_params['encoder.blocks.' + str(i) + '.mlp.0.bias'].numpy())
-
-        t = trans_weight(model_params['encoder.blocks.' + str(i) +
-                                      '.mlp.2.weight'].numpy())
-        if t is not None:
-            dst = tensorrt_llm_whisper.encoder_layers[i].mlp.proj.weight
-            if use_weight_only:
-                processed_torch_weights, torch_weight_scales = torch.ops.trtllm.symmetric_quantize_last_axis_of_batched_matrix(
-                    torch.tensor(np.ascontiguousarray(t.transpose(1, 0))),
-                    plugin_weight_only_quant_type)
-                dst.value = processed_torch_weights.numpy()
-                scales = tensorrt_llm_whisper.encoder_layers[
-                    i].mlp.proj.per_channel_scale
-                scales.value = torch_weight_scales.numpy()
-            else:
-                dst.value = t
-        tensorrt_llm_whisper.encoder_layers[
-            i].mlp.proj.bias.value = trans_weight(
-                model_params['encoder.blocks.' + str(i) +
-                             '.mlp.2.bias'].numpy())
-
-    tensorrt_llm_whisper.ln_post.weight.value = model_params[
-        'encoder.ln_post.weight'].numpy()
-    tensorrt_llm_whisper.ln_post.bias.value = model_params[
-        'encoder.ln_post.bias'].numpy()
+def load_audio_wav_format(wav_path):
+    # make sure audio in .wav format
+    assert wav_path.endswith(".wav"), f"Only support .wav format, but got {wav_path}"
+    waveform, sample_rate = soundfile.read(wav_path)
+    assert sample_rate == 16000, f"Only support 16k sample rate, but got {sample_rate}"
+    return waveform, sample_rate
 
 
-def fuse_qkv(q, k, v):
-    qkv_weight = np.concatenate((q, k, v))
-    return qkv_weight
+def pad_or_trim(array, length: int = N_SAMPLES, *, axis: int = -1):
+    """
+    Pad or trim the audio array to N_SAMPLES, as expected by the encoder.
+    """
+    if torch.is_tensor(array):
+        if array.shape[axis] > length:
+            array = array.index_select(
+                dim=axis, index=torch.arange(length, device=array.device)
+            )
+
+        if array.shape[axis] < length:
+            pad_widths = [(0, 0)] * array.ndim
+            pad_widths[axis] = (0, length - array.shape[axis])
+            array = F.pad(array, [pad for sizes in pad_widths[::-1] for pad in sizes])
+    else:
+        if array.shape[axis] > length:
+            array = array.take(indices=range(length), axis=axis)
+
+        if array.shape[axis] < length:
+            pad_widths = [(0, 0)] * array.ndim
+            pad_widths[axis] = (0, length - array.shape[axis])
+            array = np.pad(array, pad_widths)
+
+    return array
 
 
-def load_decoder_weight(
-    tllm_model,
-    model_params: dict,
+@lru_cache(maxsize=None)
+def mel_filters(device, n_mels: int, mel_filters_dir: str = None) -> torch.Tensor:
+    """
+    load the mel filterbank matrix for projecting STFT into a Mel spectrogram.
+    Allows decoupling librosa dependency; saved using:
+
+        np.savez_compressed(
+            "mel_filters.npz",
+            mel_80=librosa.filters.mel(sr=16000, n_fft=400, n_mels=80),
+        )
+    """
+    assert n_mels in {80, 128}, f"Unsupported n_mels: {n_mels}"
+    if mel_filters_dir is None:
+        mel_filters_path = os.path.join(
+            os.path.dirname(__file__), "assets", "mel_filters.npz"
+        )
+    else:
+        mel_filters_path = os.path.join(mel_filters_dir, "mel_filters.npz")
+    with np.load(mel_filters_path) as f:
+        return torch.from_numpy(f[f"mel_{n_mels}"]).to(device)
+
+
+def log_mel_spectrogram(
+    audio: Union[str, np.ndarray, torch.Tensor],
+    n_mels: int,
+    padding: int = 0,
+    device: Optional[Union[str, torch.device]] = None,
+    return_duration: bool = False,
+    mel_filters_dir: str = None,
 ):
-    tensorrt_llm.logger.info('Loading decoder weights from PT...')
+    """
+    Compute the log-Mel spectrogram of
 
-    quant_mode = getattr(tllm_model, 'quant_mode', QuantMode(0))
-    param_dtype = 'float16'
+    Parameters
+    ----------
+    audio: Union[str, np.ndarray, torch.Tensor], shape = (*)
+        The path to audio or either a NumPy array or Tensor containing the audio waveform in 16 kHz
 
-    if quant_mode.is_int8_weight_only():
-        plugin_weight_only_quant_type = torch.int8
-    elif quant_mode.is_int4_weight_only():
-        plugin_weight_only_quant_type = torch.quint4x2
-    use_weight_only = quant_mode.is_weight_only()
+    n_mels: int
+        The number of Mel-frequency filters, only 80 and 128 are supported
 
-    tllm_model.embedding.vocab_embedding.weight.value = trans_weight(
-        model_params['decoder.token_embedding.weight'].numpy())
-    tllm_model.lm_head.weight.value = trans_weight(
-        model_params['decoder.token_embedding.weight'].numpy())
-    if tllm_model.embedding.position_embedding:
-        tllm_model.embedding.position_embedding.weight.value = trans_weight(
-            model_params['decoder.positional_embedding'].numpy())
+    padding: int
+        Number of zero samples to pad to the right
 
-    for i in range(tllm_model.num_layers):
-        layer = tllm_model.decoder_layers[i]
+    device: Optional[Union[str, torch.device]]
+        If given, the audio tensor is moved to this device before STFT
 
-        t = torch.cat([
-            model_params['decoder.blocks.' + str(i) + '.attn.query.weight'],
-            model_params['decoder.blocks.' + str(i) + '.attn.key.weight'],
-            model_params['decoder.blocks.' + str(i) + '.attn.value.weight']
-        ],
-                      dim=0).numpy()
-
-        if t is not None:
-            dst = layer.self_attention.qkv.weight
-            if use_weight_only:
-                processed_torch_weights, torch_weight_scales = torch.ops.trtllm.symmetric_quantize_last_axis_of_batched_matrix(
-                    torch.tensor(np.ascontiguousarray(t.transpose(1, 0))),
-                    plugin_weight_only_quant_type)
-                dst.value = torch.tensor(np.ascontiguousarray(t.transpose(
-                    1, 0))).numpy().astype(str_dtype_to_np(param_dtype))
-                scales = layer.self_attention.qkv.per_channel_scale
-                scales.value = torch_weight_scales.numpy()
+    Returns
+    -------
+    torch.Tensor, shape = (80 or 128, n_frames)
+        A Tensor that contains the Mel spectrogram
+    """
+    if not torch.is_tensor(audio):
+        if isinstance(audio, str):
+            if audio.endswith(".wav"):
+                audio, _ = load_audio_wav_format(audio)
             else:
-                dst.value = t
+                audio = load_audio(audio)
+        assert isinstance(audio, np.ndarray), f"Unsupported audio type: {type(audio)}"
+        duration = audio.shape[-1] / SAMPLE_RATE
+        audio = pad_or_trim(audio, N_SAMPLES)
+        audio = audio.astype(np.float32)
+        audio = torch.from_numpy(audio)
 
-        t = trans_weight(model_params['decoder.blocks.' + str(i) +
-                                      '.attn.out.weight'].numpy())
+    if device is not None:
+        audio = audio.to(device)
+    if padding > 0:
+        audio = F.pad(audio, (0, padding))
+    window = torch.hann_window(N_FFT).to(audio.device)
+    stft = torch.stft(audio, N_FFT, HOP_LENGTH, window=window, return_complex=True)
+    magnitudes = stft[..., :-1].abs() ** 2
 
-        if t is not None:
-            dst = layer.self_attention.dense.weight
-            if use_weight_only:
-                processed_torch_weights, torch_weight_scales = torch.ops.trtllm.symmetric_quantize_last_axis_of_batched_matrix(
-                    torch.tensor(np.ascontiguousarray(t.transpose(1, 0))),
-                    plugin_weight_only_quant_type)
-                dst.value = torch.tensor(np.ascontiguousarray(t.transpose(
-                    1, 0))).numpy().astype(str_dtype_to_np(param_dtype))
-                scales = layer.self_attention.dense.per_channel_scale
-                scales.value = torch_weight_scales.numpy()
+    filters = mel_filters(audio.device, n_mels, mel_filters_dir)
+    mel_spec = filters @ magnitudes
+
+    log_spec = torch.clamp(mel_spec, min=1e-10).log10()
+    log_spec = torch.maximum(log_spec, log_spec.max() - 8.0)
+    log_spec = (log_spec + 4.0) / 4.0
+    if return_duration:
+        return log_spec, duration
+    else:
+        return log_spec
+
+
+def store_transcripts(
+    filename: Pathlike, texts: Iterable[Tuple[str, str, str]]
+) -> None:
+    """Save predicted results and reference transcripts to a file.
+    https://github.com/k2-fsa/icefall/blob/master/icefall/utils.py
+    Args:
+      filename:
+        File to save the results to.
+      texts:
+        An iterable of tuples. The first element is the cur_id, the second is
+        the reference transcript and the third element is the predicted result.
+    Returns:
+      Return None.
+    """
+    with open(filename, "w") as f:
+        for cut_id, ref, hyp in texts:
+            print(f"{cut_id}:\tref={ref}", file=f)
+            print(f"{cut_id}:\thyp={hyp}", file=f)
+
+
+def write_error_stats(
+    f: TextIO,
+    test_set_name: str,
+    results: List[Tuple[str, str]],
+    enable_log: bool = True,
+) -> float:
+    """Write statistics based on predicted results and reference transcripts.
+    https://github.com/k2-fsa/icefall/blob/master/icefall/utils.py
+    It will write the following to the given file:
+
+        - WER
+        - number of insertions, deletions, substitutions, corrects and total
+          reference words. For example::
+
+              Errors: 23 insertions, 57 deletions, 212 substitutions, over 2606
+              reference words (2337 correct)
+
+        - The difference between the reference transcript and predicted result.
+          An instance is given below::
+
+            THE ASSOCIATION OF (EDISON->ADDISON) ILLUMINATING COMPANIES
+
+          The above example shows that the reference word is `EDISON`,
+          but it is predicted to `ADDISON` (a substitution error).
+
+          Another example is::
+
+            FOR THE FIRST DAY (SIR->*) I THINK
+
+          The reference word `SIR` is missing in the predicted
+          results (a deletion error).
+      results:
+        An iterable of tuples. The first element is the cur_id, the second is
+        the reference transcript and the third element is the predicted result.
+      enable_log:
+        If True, also print detailed WER to the console.
+        Otherwise, it is written only to the given file.
+    Returns:
+      Return None.
+    """
+    subs: Dict[Tuple[str, str], int] = defaultdict(int)
+    ins: Dict[str, int] = defaultdict(int)
+    dels: Dict[str, int] = defaultdict(int)
+
+    # `words` stores counts per word, as follows:
+    #   corr, ref_sub, hyp_sub, ins, dels
+    words: Dict[str, List[int]] = defaultdict(lambda: [0, 0, 0, 0, 0])
+    num_corr = 0
+    ERR = "*"
+    for cut_id, ref, hyp in results:
+        ali = kaldialign.align(ref, hyp, ERR)
+        for ref_word, hyp_word in ali:
+            if ref_word == ERR:
+                ins[hyp_word] += 1
+                words[hyp_word][3] += 1
+            elif hyp_word == ERR:
+                dels[ref_word] += 1
+                words[ref_word][4] += 1
+            elif hyp_word != ref_word:
+                subs[(ref_word, hyp_word)] += 1
+                words[ref_word][1] += 1
+                words[hyp_word][2] += 1
             else:
-                dst.value = t
+                words[ref_word][0] += 1
+                num_corr += 1
+    ref_len = sum([len(r) for _, r, _ in results])
+    sub_errs = sum(subs.values())
+    ins_errs = sum(ins.values())
+    del_errs = sum(dels.values())
+    tot_errs = sub_errs + ins_errs + del_errs
+    tot_err_rate = "%.2f" % (100.0 * tot_errs / ref_len)
 
-        if tllm_model.has_attention_qkvo_bias:
-            bias_shape = model_params['decoder.blocks.' + str(i) +
-                                      '.attn.query.bias'].shape
-            dtype = model_params['decoder.blocks.' + str(i) +
-                                 '.attn.query.bias'].dtype
-            layer.self_attention.qkv.bias.value = fuse_qkv(
-                trans_weight(model_params['decoder.blocks.' + str(i) +
-                                          '.attn.query.bias'].numpy()),
-                torch.zeros([*bias_shape], dtype=dtype).numpy(),
-                trans_weight(model_params['decoder.blocks.' + str(i) +
-                                          '.attn.value.bias'].numpy()))
-            layer.self_attention.dense.bias.value = trans_weight(
-                model_params['decoder.blocks.' + str(i) +
-                             '.attn.out.bias'].numpy())
+    if enable_log:
+        logging.info(
+            f"[{test_set_name}] %WER {tot_errs / ref_len:.2%} "
+            f"[{tot_errs} / {ref_len}, {ins_errs} ins, "
+            f"{del_errs} del, {sub_errs} sub ]"
+        )
 
-        layer.self_attention_layernorm.weight.value = trans_weight(
-            model_params['decoder.blocks.' + str(i) +
-                         '.attn_ln.weight'].numpy())
-        layer.self_attention_layernorm.bias.value = trans_weight(
-            model_params['decoder.blocks.' + str(i) + '.attn_ln.bias'].numpy())
+    print(f"%WER = {tot_err_rate}", file=f)
+    print(
+        f"Errors: {ins_errs} insertions, {del_errs} deletions, "
+        f"{sub_errs} substitutions, over {ref_len} reference "
+        f"words ({num_corr} correct)",
+        file=f,
+    )
+    print(
+        "Search below for sections starting with PER-UTT DETAILS:, "
+        "SUBSTITUTIONS:, DELETIONS:, INSERTIONS:, PER-WORD STATS:",
+        file=f,
+    )
 
-        t = torch.cat([
-            model_params['decoder.blocks.' + str(i) +
-                         '.cross_attn.query.weight'],
-            model_params['decoder.blocks.' + str(i) + '.cross_attn.key.weight'],
-            model_params['decoder.blocks.' + str(i) +
-                         '.cross_attn.value.weight']
-        ],
-                      dim=0).numpy()
+    print("", file=f)
+    print("PER-UTT DETAILS: corr or (ref->hyp)  ", file=f)
+    for cut_id, ref, hyp in results:
+        ali = kaldialign.align(ref, hyp, ERR)
+        combine_successive_errors = True
+        if combine_successive_errors:
+            ali = [[[x], [y]] for x, y in ali]
+            for i in range(len(ali) - 1):
+                if ali[i][0] != ali[i][1] and ali[i + 1][0] != ali[i + 1][1]:
+                    ali[i + 1][0] = ali[i][0] + ali[i + 1][0]
+                    ali[i + 1][1] = ali[i][1] + ali[i + 1][1]
+                    ali[i] = [[], []]
+            ali = [
+                [
+                    list(filter(lambda a: a != ERR, x)),
+                    list(filter(lambda a: a != ERR, y)),
+                ]
+                for x, y in ali
+            ]
+            ali = list(filter(lambda x: x != [[], []], ali))
+            ali = [
+                [
+                    ERR if x == [] else " ".join(x),
+                    ERR if y == [] else " ".join(y),
+                ]
+                for x, y in ali
+            ]
 
-        if t is not None:
-            dst = layer.cross_attention.qkv.weight
-            if use_weight_only:
-                processed_torch_weights, torch_weight_scales = torch.ops.trtllm.symmetric_quantize_last_axis_of_batched_matrix(
-                    torch.tensor(np.ascontiguousarray(t.transpose(1, 0))),
-                    plugin_weight_only_quant_type)
-                dst.value = torch.tensor(np.ascontiguousarray(t.transpose(
-                    1, 0))).numpy().astype(str_dtype_to_np(param_dtype))
-                scales = layer.cross_attention.qkv.per_channel_scale
-                scales.value = torch_weight_scales.numpy()
-            else:
-                dst.value = t
+        print(
+            f"{cut_id}:\t"
+            + " ".join(
+                (
+                    ref_word if ref_word == hyp_word else f"({ref_word}->{hyp_word})"
+                    for ref_word, hyp_word in ali
+                )
+            ),
+            file=f,
+        )
 
-        layer.cross_attention.dense.weight.value = trans_weight(
-            model_params['decoder.blocks.' + str(i) +
-                         '.cross_attn.out.weight'].numpy())
+    print("", file=f)
+    print("SUBSTITUTIONS: count ref -> hyp", file=f)
 
-        t = trans_weight(model_params['decoder.blocks.' + str(i) +
-                                      '.cross_attn.out.weight'].numpy())
+    for count, (ref, hyp) in sorted([(v, k) for k, v in subs.items()], reverse=True):
+        print(f"{count}   {ref} -> {hyp}", file=f)
 
-        if t is not None:
-            dst = layer.cross_attention.dense.weight
-            if use_weight_only:
-                processed_torch_weights, torch_weight_scales = torch.ops.trtllm.symmetric_quantize_last_axis_of_batched_matrix(
-                    torch.tensor(np.ascontiguousarray(t.transpose(1, 0))),
-                    plugin_weight_only_quant_type)
-                dst.value = torch.tensor(np.ascontiguousarray(t.transpose(
-                    1, 0))).numpy().astype(str_dtype_to_np(param_dtype))
-                scales = layer.cross_attention.dense.per_channel_scale
-                scales.value = torch_weight_scales.numpy()
-            else:
-                dst.value = t
+    print("", file=f)
+    print("DELETIONS: count ref", file=f)
+    for count, ref in sorted([(v, k) for k, v in dels.items()], reverse=True):
+        print(f"{count}   {ref}", file=f)
 
-        if tllm_model.has_attention_qkvo_bias:
-            bias_shape = model_params['decoder.blocks.' + str(i) +
-                                      '.cross_attn.query.bias'].shape
-            dtype = model_params['decoder.blocks.' + str(i) +
-                                 '.cross_attn.query.bias'].dtype
-            cross_attn_qkv_bias = fuse_qkv(
-                trans_weight(model_params['decoder.blocks.' + str(i) +
-                                          '.cross_attn.query.bias'].numpy()),
-                torch.zeros([*bias_shape], dtype=dtype).numpy(),
-                trans_weight(model_params['decoder.blocks.' + str(i) +
-                                          '.cross_attn.value.bias'].numpy()))
+    print("", file=f)
+    print("INSERTIONS: count hyp", file=f)
+    for count, hyp in sorted([(v, k) for k, v in ins.items()], reverse=True):
+        print(f"{count}   {hyp}", file=f)
 
-            layer.cross_attention.qkv.bias.value = cross_attn_qkv_bias
+    print("", file=f)
+    print("PER-WORD STATS: word  corr tot_errs count_in_ref count_in_hyp", file=f)
+    for _, word, counts in sorted(
+        [(sum(v[1:]), k, v) for k, v in words.items()], reverse=True
+    ):
+        (corr, ref_sub, hyp_sub, ins, dels) = counts
+        tot_errs = ref_sub + hyp_sub + ins + dels
+        ref_count = corr + ref_sub + dels
+        hyp_count = corr + hyp_sub + ins
 
-            layer.cross_attention.dense.bias.value = trans_weight(
-                model_params['decoder.blocks.' + str(i) +
-                             '.cross_attn.out.bias'].numpy())
-
-        layer.cross_attention_layernorm.weight.value = trans_weight(
-            model_params['decoder.blocks.' + str(i) +
-                         '.cross_attn_ln.weight'].numpy())
-        layer.cross_attention_layernorm.bias.value = trans_weight(
-            model_params['decoder.blocks.' + str(i) +
-                         '.cross_attn_ln.bias'].numpy())
-
-        t = trans_weight(model_params['decoder.blocks.' + str(i) +
-                                      '.mlp.0.weight'].numpy())
-
-        if t is not None:
-            dst = layer.mlp.fc.weight
-            if use_weight_only:
-                processed_torch_weights, torch_weight_scales = torch.ops.trtllm.symmetric_quantize_last_axis_of_batched_matrix(
-                    torch.tensor(np.ascontiguousarray(t.transpose(1, 0))),
-                    plugin_weight_only_quant_type)
-                dst.value = torch.tensor(np.ascontiguousarray(t.transpose(
-                    1, 0))).numpy().astype(str_dtype_to_np(param_dtype))
-                scales = layer.mlp.fc.per_channel_scale
-                scales.value = torch_weight_scales.numpy()
-            else:
-                dst.value = t
-
-        t = trans_weight(model_params['decoder.blocks.' + str(i) +
-                                      '.mlp.2.weight'].numpy())
-
-        if t is not None:
-            dst = layer.mlp.proj.weight
-            if use_weight_only:
-                processed_torch_weights, torch_weight_scales = torch.ops.trtllm.symmetric_quantize_last_axis_of_batched_matrix(
-                    torch.tensor(np.ascontiguousarray(t.transpose(1, 0))),
-                    plugin_weight_only_quant_type)
-                dst.value = torch.tensor(np.ascontiguousarray(t.transpose(
-                    1, 0))).numpy().astype(str_dtype_to_np(param_dtype))
-                scales = layer.mlp.proj.per_channel_scale
-                scales.value = torch_weight_scales.numpy()
-            else:
-                dst.value = t
-
-        if tllm_model.has_mlp_bias:
-            layer.mlp.fc.bias.value = trans_weight(
-                model_params['decoder.blocks.' + str(i) +
-                             '.mlp.0.bias'].numpy())
-            layer.mlp.proj.bias.value = trans_weight(
-                model_params['decoder.blocks.' + str(i) +
-                             '.mlp.2.bias'].numpy())
-
-        layer.mlp_layernorm.weight.value = trans_weight(
-            model_params['decoder.blocks.' + str(i) + '.mlp_ln.weight'].numpy())
-        layer.mlp_layernorm.bias.value = trans_weight(
-            model_params['decoder.blocks.' + str(i) + '.mlp_ln.bias'].numpy())
-
-    if tllm_model.final_layernorm:
-        tllm_model.final_layernorm.weight.value = trans_weight(
-            model_params['decoder.ln.weight'].numpy())
-        tllm_model.final_layernorm.bias.value = trans_weight(
-            model_params['decoder.ln.bias'].numpy())
+        print(f"{word}   {corr} {tot_errs} {ref_count} {hyp_count}", file=f)
+    return float(tot_err_rate)

@@ -1,8 +1,7 @@
+import hashlib
 import os
 import urllib
-import hashlib
 import warnings
-from typing import List, Optional, Union
 
 from tqdm import tqdm
 
@@ -21,19 +20,21 @@ _TOKENIZER = {
     "large-v3": "https://huggingface.co/Systran/faster-whisper-large-v3/raw/main/tokenizer.json",
 }
 
+
 def download_model(name):
-    
     url = _MODELS[name]
     expected_sha256 = url.split("/")[-2]
-    
+
     download_path = os.path.join(SAVE_DIR, name)
     os.makedirs(download_path, exist_ok=True)
-    
-    model_ckpt_path = os.path.join(download_path, "pt_ckpt.pt")
+
+    model_ckpt_path = os.path.join(download_path, f"{name}.pt")
     tokenizer_path = os.path.join(download_path, "tokenizer.json")
-    
+
     if not os.path.exists(tokenizer_path):
-        with urllib.request.urlopen(_TOKENIZER[name]) as source, open(tokenizer_path, "wb") as output:
+        with urllib.request.urlopen(_TOKENIZER[name]) as source, open(
+            tokenizer_path, "wb"
+        ) as output:
             with tqdm(
                 total=int(source.info().get("Content-Length")),
                 ncols=80,
@@ -55,7 +56,7 @@ def download_model(name):
     if os.path.isfile(model_ckpt_path):
         with open(model_ckpt_path, "rb") as f:
             model_bytes = f.read()
-            
+
         if hashlib.sha256(model_bytes).hexdigest() == expected_sha256:
             return model_ckpt_path, tokenizer_path
         else:

@@ -1,4 +1,4 @@
-# Modified from: https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/whisper
+# Modified from: https://github.com/NVIDIA/TensorRT-LLM/blob/5fa9436e17c2f9aeace070f49aa645d2577f676b/examples/whisper/convert_checkpoint.py
 
 # SPDX-FileCopyrightText: Copyright (c) 2022-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
@@ -15,280 +15,493 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import argparse
+import json
 import os
 import time
-import argparse
 
 import torch
-import tensorrt_llm
-from tensorrt_llm import str_dtype_to_torch, str_dtype_to_trt
-
-from tensorrt_llm.logger import logger
-from tensorrt_llm.builder import Builder
-from tensorrt_llm.network import net_guard
-from tensorrt_llm.models import quantize_model
-from tensorrt_llm.quantization import QuantMode
-from tensorrt_llm.plugin.plugin import ContextFMHAType
+from safetensors.torch import save_file
 from tensorrt_llm.functional import LayerNormPositionType, LayerNormType
+from tensorrt_llm.models.convert_utils import weight_only_quantize_dict
+from tensorrt_llm.quantization import QuantAlgo
 
 from . import load_trt_build_config
-from .model_utils import load_encoder_weight, load_decoder_weight
+from .model_utils import sinusoids
 
 
-def get_export_size(output_path):
-    return os.popen(f'du -sh {output_path}').read().split("\t")[0]
-
-
-def serialize_engine(engine, path):
-    with open(path, 'wb') as f:
-        f.write(engine)
-        
-
-def build_encoder(model, args):
-    
-    model_metadata = model['dims']
-    model_params = model['model_state_dict']
-
-    # cast params according dtype
-    for k, v in model_params.items():
-        model_params[k] = v.to(str_dtype_to_torch(args.dtype))
-
-    builder = Builder()
-    
-    max_batch_size = args.max_batch_size
-    hidden_states = model_metadata['n_audio_state']
-    num_heads = model_metadata['n_audio_head']
-    num_layers = model_metadata['n_audio_layer']
-
-    model_is_multilingual = (model_metadata['n_vocab'] >= 51865)
-
-    builder_config = builder.create_builder_config(
-        name="encoder",
-        precision=args.dtype,
-        tensor_parallel=1,
-        num_layers=num_layers,
-        num_heads=num_heads,
-        hidden_size=hidden_states,
-        max_batch_size=max_batch_size,
-        int8=args.quant_mode_enc.has_act_or_weight_quant(),
-        n_mels=model_metadata['n_mels'],
-        num_languages=model_metadata['n_vocab'] - 51765 -
-        int(model_is_multilingual),
+def parse_arguments():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--model_dir", type=str, default="assets")
+    parser.add_argument("--quant_ckpt_path", type=str, default=None)
+    parser.add_argument(
+        "--model_name",
+        type=str,
+        default="large-v2",
+        choices=[
+            "large-v3",
+            "large-v2",
+            "medium",
+            "small",
+            "base",
+            "tiny",
+            "medium.en",
+            "small.en",
+            "base.en",
+            "tiny.en",
+            "distil-large-v3",
+            "distil-large-v2",
+            "distil-medium.en",
+            "distil-small.en",
+        ],
     )
-
-    tensorrt_llm_whisper_encoder = tensorrt_llm.models.WhisperEncoder(
-        model_metadata['n_mels'], model_metadata['n_audio_ctx'],
-        model_metadata['n_audio_state'], model_metadata['n_audio_head'],
-        model_metadata['n_audio_layer'], str_dtype_to_trt(args.dtype))
-    
-    
-    if args.use_weight_only_enc:
-        tensorrt_llm_whisper_encoder = quantize_model(
-            tensorrt_llm_whisper_encoder, args.quant_mode_enc)
-
-    load_encoder_weight(tensorrt_llm_whisper_encoder, model_metadata,
-                        model_params, model_metadata['n_audio_layer'])
-
-    network = builder.create_network()
-
-    if args.use_gemm_plugin:
-        network.plugin_config.set_gemm_plugin(dtype=args.use_gemm_plugin)
-        
-    if args.use_layernorm_plugin:
-        network.plugin_config.set_layernorm_plugin(dtype=args.use_layernorm_plugin)
-        
-    if args.use_bert_attention_plugin:
-        network.plugin_config.set_bert_attention_plugin(dtype=args.use_bert_attention_plugin)
-
-        if args.use_context_fmha_enc:
-            network.plugin_config.set_context_fmha(ContextFMHAType.enabled)
-        
-    if args.remove_input_padding:
-        network.plugin_config.enable_remove_input_padding()
-    
-    if args.use_weight_only_enc:
-        network.plugin_config.set_weight_only_quant_matmul_plugin(
-            dtype=args.dtype)
-    
-    with net_guard(network):
-        inputs = tensorrt_llm_whisper_encoder.prepare_inputs(
-            args.max_batch_size)
-
-        tensorrt_llm_whisper_encoder(*inputs)
-
-        if args.debug_mode:
-            for k, v in tensorrt_llm_whisper_encoder.named_network_outputs():
-                network._mark_output(v, k, str_dtype_to_trt(args.dtype))
-
-    engine = None
-    engine = builder.build_engine(network, builder_config)
-
-    config_path = os.path.join(args.output_dir, 'encoder_config.json')
-    builder.save_config(builder_config, config_path)
-    
-    serialize_engine(engine, os.path.join(args.output_dir, "encoder.engine"))
-
-
-def build_decoder(model, args):
-
-    model_metadata = model['dims']
-    model_params = model['model_state_dict']
-
-    # cast params according dtype
-    for k, v in model_params.items():
-        model_params[k] = v.to(str_dtype_to_torch(args.dtype))
-
-    builder = Builder()
-
-    timing_cache_file = os.path.join(args.output_dir, 'decoder_model.cache')
-    builder_config = builder.create_builder_config(
-        name="decoder",
-        precision=args.dtype,
-        timing_cache=timing_cache_file,
-        tensor_parallel=args.world_size,
-        num_layers=model_metadata['n_text_layer'],
-        num_heads=model_metadata['n_text_head'],
-        hidden_size=model_metadata['n_text_state'],
-        vocab_size=model_metadata['n_vocab'],
-        hidden_act="gelu",
-        max_position_embeddings=model_metadata['n_text_ctx'],
-        apply_query_key_layer_scaling=False,
-        max_batch_size=args.max_batch_size,
-        max_input_len=args.max_input_len,
-        max_output_len=args.max_output_len,
-        opt_level=None,
-        cross_attention=True,
-        has_position_embedding=True,
-        has_token_type_embedding=False,
-        int8=args.quant_mode_dec.has_act_or_weight_quant()
+    parser.add_argument(
+        "--dtype",
+        type=str,
+        default="float16",
+        choices=["float32", "bfloat16", "float16"],
     )
-
-    tensorrt_llm_whisper_decoder = tensorrt_llm.models.DecoderModel(
-        num_layers=model_metadata['n_text_layer'],
-        num_heads=model_metadata['n_text_head'],
-        hidden_size=model_metadata['n_text_state'],
-        ffn_hidden_size=4 * model_metadata['n_text_state'],
-        encoder_hidden_size=model_metadata['n_text_state'],
-        encoder_num_heads=model_metadata['n_text_head'],
-        vocab_size=model_metadata['n_vocab'],
-        head_size=model_metadata['n_text_state'] //
-        model_metadata['n_text_head'],
-        max_position_embeddings=model_metadata['n_text_ctx'],
-        has_position_embedding=True,
-        relative_attention=False,
-        max_distance=0,
-        num_buckets=0,
-        has_embedding_layernorm=False,
-        has_embedding_scale=False,
-        q_scaling=1.0,
-        has_attention_qkvo_bias=True,
-        has_mlp_bias=True,
-        has_model_final_layernorm=True,
-        layernorm_eps=1e-5,
-        layernorm_position=LayerNormPositionType.pre_layernorm,
-        layernorm_type=LayerNormType.LayerNorm,
-        hidden_act="gelu",
-        rescale_before_lm_head=False,
-        dtype=str_dtype_to_trt(args.dtype),
-        logits_dtype=str_dtype_to_trt(args.dtype))
-
-    if args.use_weight_only_dec:
-        tensorrt_llm_whisper_decoder = quantize_model(
-            tensorrt_llm_whisper_decoder, args.quant_mode_dec)
-
-    load_decoder_weight(
-        tensorrt_llm_whisper_decoder,
-        model_params,
+    parser.add_argument(
+        "--logits_dtype", type=str, default="float16", choices=["float16", "float32"]
     )
+    # NOTE: this is the only one used.
+    parser.add_argument(
+        "--output_dir",
+        type=str,
+        default="tllm_checkpoint",
+        help="The path to save the TensorRT-LLM checkpoint",
+    )
+    parser.add_argument(
+        "--use_weight_only",
+        default=False,
+        action="store_true",
+        help="Quantize weights for the various GEMMs to INT4/INT8."
+        "See --weight_only_precision to set the precision",
+    )
+    parser.add_argument(
+        "--weight_only_precision",
+        const="int8",
+        type=str,
+        nargs="?",
+        default="int8",
+        choices=["int8", "int4"],
+        help="Define the precision for the weights when using weight-only quantization."
+        "You must also use --use_weight_only for that argument to have an impact.",
+    )
+    args = parser.parse_args()
+    return args
 
-    network = builder.create_network()
 
-    if args.use_gemm_plugin:
-        network.plugin_config.set_gemm_plugin(dtype=args.use_gemm_plugin)
-        
-    if args.use_layernorm_plugin:
-        network.plugin_config.set_layernorm_plugin(dtype=args.use_layernorm_plugin)
-        
-    if args.use_gpt_attention_plugin:
-        network.plugin_config.set_gpt_attention_plugin(dtype=args.use_gpt_attention_plugin)
+def get_encoder_config(model_metadata: dict, dtype: str, quant_algo: QuantAlgo) -> dict:
+    model_is_multilingual = model_metadata["n_vocab"] >= 51865
+    num_languages = model_metadata["n_vocab"] - 51765 - int(model_is_multilingual)
+    return {
+        "architecture": "WhisperEncoder",
+        "dtype": dtype,
+        "num_hidden_layers": model_metadata["n_audio_layer"],
+        "num_attention_heads": model_metadata["n_audio_head"],
+        "hidden_size": model_metadata["n_audio_state"],
+        "n_mels": model_metadata["n_mels"],
+        "n_audio_ctx": model_metadata["n_audio_ctx"],
+        "vocab_size": model_metadata["n_vocab"],
+        "hidden_act": "gelu",
+        "num_languages": num_languages,
+        "quantization": {"quant_algo": quant_algo},
+    }
 
-        if args.use_context_fmha_dec:
-            network.plugin_config.set_context_fmha(ContextFMHAType.enabled)
-        
-    if args.remove_input_padding:
-        network.plugin_config.enable_remove_input_padding()
 
-    with net_guard(network):
-        inputs = tensorrt_llm_whisper_decoder.prepare_inputs(
-            args.max_batch_size,
-            args.max_beam_width,
-            args.max_input_len,
-            args.max_output_len,
-            model_metadata['n_audio_ctx'],
+def get_decoder_config(
+    model_metadata: dict,
+    dtype: str,
+    logits_dtype: str,
+    quant_algo: QuantAlgo,
+) -> dict:
+    return {
+        "architecture": "DecoderModel",
+        "dtype": dtype,
+        "logits_dtype": logits_dtype,
+        "num_hidden_layers": model_metadata["n_text_layer"],
+        "num_attention_heads": model_metadata["n_text_head"],
+        "hidden_size": model_metadata["n_text_state"],
+        "norm_epsilon": 1e-5,
+        "vocab_size": model_metadata["n_vocab"],
+        "hidden_act": "gelu",
+        "use_parallel_embedding": False,
+        "embedding_sharding_dim": 0,
+        "max_position_embeddings": model_metadata["n_text_ctx"],
+        "use_prompt_tuning": False,
+        "head_size": model_metadata["n_text_state"] // model_metadata["n_text_head"],
+        "has_position_embedding": True,
+        "layernorm_type": LayerNormType.LayerNorm,
+        "has_attention_qkvo_bias": True,
+        "has_mlp_bias": True,
+        "has_model_final_layernorm": True,
+        "has_embedding_layernorm": False,
+        "has_embedding_scale": False,
+        "ffn_hidden_size": 4 * model_metadata["n_text_state"],
+        "q_scaling": 1.0,
+        "layernorm_position": LayerNormPositionType.pre_layernorm,
+        "relative_attention": False,
+        "max_distance": 0,
+        "num_buckets": 0,
+        "model_type": "whisper",
+        "rescale_before_lm_head": False,
+        "encoder_hidden_size": model_metadata["n_text_state"],
+        "encoder_num_heads": model_metadata["n_text_head"],
+        "encoder_head_size": None,
+        "skip_cross_qkv": False,
+        "quantization": {"quant_algo": quant_algo},
+    }
+
+
+def convert_openai_whisper_encoder(
+    model_metadata: dict,
+    model_params: dict,
+    quant_algo: QuantAlgo | None = None,
+):
+    weights = {}
+
+    weights["positional_embedding"] = sinusoids(
+        model_metadata["n_audio_ctx"], model_metadata["n_audio_state"]
+    ).contiguous()
+
+    weights["conv1.weight"] = torch.unsqueeze(
+        model_params["encoder.conv1.weight"], -1
+    ).contiguous()
+    weights["conv1.bias"] = model_params["encoder.conv1.bias"].contiguous()
+    weights["conv2.weight"] = torch.unsqueeze(
+        model_params["encoder.conv2.weight"], -1
+    ).contiguous()
+    weights["conv2.bias"] = model_params["encoder.conv2.bias"].contiguous()
+
+    # Encoder conv needs to run in fp32 on Volta/Turing
+    major, minor = torch.cuda.get_device_capability()
+    if not major >= 8:
+        weights["conv1.weight"] = weights["conv1.weight"].float()
+        weights["conv1.bias"] = weights["conv1.bias"].float()
+        weights["conv2.weight"] = weights["conv2.weight"].float()
+        weights["conv2.bias"] = weights["conv2.bias"].float()
+
+    for i in range(model_metadata["n_audio_layer"]):
+        weights[f"encoder_layers.{i}.attention_layernorm.weight"] = model_params[
+            "encoder.blocks." + str(i) + ".attn_ln.weight"
+        ].contiguous()
+        weights[f"encoder_layers.{i}.attention_layernorm.bias"] = model_params[
+            "encoder.blocks." + str(i) + ".attn_ln.bias"
+        ].contiguous()
+
+        t = torch.cat(
+            [
+                model_params["encoder.blocks." + str(i) + ".attn.query.weight"],
+                model_params["encoder.blocks." + str(i) + ".attn.key.weight"],
+                model_params["encoder.blocks." + str(i) + ".attn.value.weight"],
+            ],
+            dim=0,
+        ).contiguous()
+
+        weights[f"encoder_layers.{i}.attention.qkv.weight"] = t
+
+        bias_shape = model_params["encoder.blocks." + str(i) + ".attn.query.bias"].shape
+        dtype = model_params["encoder.blocks." + str(i) + ".attn.query.bias"].dtype
+        fused_bias = torch.cat(
+            [
+                model_params["encoder.blocks." + str(i) + ".attn.query.bias"],
+                torch.zeros([*bias_shape], dtype=dtype),
+                model_params["encoder.blocks." + str(i) + ".attn.value.bias"],
+            ],
+            dim=0,
+        ).contiguous()
+
+        weights[f"encoder_layers.{i}.attention.qkv.bias"] = fused_bias
+
+        t = model_params["encoder.blocks." + str(i) + ".attn.out.weight"].contiguous()
+
+        weights[f"encoder_layers.{i}.attention.dense.weight"] = t
+        weights[f"encoder_layers.{i}.attention.dense.bias"] = model_params[
+            "encoder.blocks." + str(i) + ".attn.out.bias"
+        ].contiguous()
+
+        weights[f"encoder_layers.{i}.mlp_layernorm.weight"] = model_params[
+            "encoder.blocks." + str(i) + ".mlp_ln.weight"
+        ].contiguous()
+        weights[f"encoder_layers.{i}.mlp_layernorm.bias"] = model_params[
+            "encoder.blocks." + str(i) + ".mlp_ln.bias"
+        ].contiguous()
+
+        t = model_params["encoder.blocks." + str(i) + ".mlp.0.weight"].contiguous()
+        weights[f"encoder_layers.{i}.mlp.fc.weight"] = t
+
+        weights[f"encoder_layers.{i}.mlp.fc.bias"] = model_params[
+            "encoder.blocks." + str(i) + ".mlp.0.bias"
+        ].contiguous()
+
+        t = model_params["encoder.blocks." + str(i) + ".mlp.2.weight"].contiguous()
+        weights[f"encoder_layers.{i}.mlp.proj.weight"] = t
+
+        weights[f"encoder_layers.{i}.mlp.proj.bias"] = model_params[
+            "encoder.blocks." + str(i) + ".mlp.2.bias"
+        ].contiguous()
+
+    weights["ln_post.weight"] = model_params["encoder.ln_post.weight"].contiguous()
+    weights["ln_post.bias"] = model_params["encoder.ln_post.bias"].contiguous()
+
+    return weight_only_quantize_dict(weights, quant_algo=quant_algo, plugin=True)  # type: ignore
+
+
+def convert_openai_whisper_decoder(
+    model_metadata: dict,
+    model_params: dict,
+    quant_algo: QuantAlgo | None = None,
+):
+    weights = {}
+
+    weights["embedding.vocab_embedding.weight"] = model_params[
+        "decoder.token_embedding.weight"
+    ]
+    weights["lm_head.weight"] = model_params["decoder.token_embedding.weight"].clone()
+    weights["embedding.position_embedding.weight"] = model_params[
+        "decoder.positional_embedding"
+    ]
+
+    for i in range(model_metadata["n_text_layer"]):
+        t = torch.cat(
+            [
+                model_params["decoder.blocks." + str(i) + ".attn.query.weight"],
+                model_params["decoder.blocks." + str(i) + ".attn.key.weight"],
+                model_params["decoder.blocks." + str(i) + ".attn.value.weight"],
+            ],
+            dim=0,
+        )
+        weights[f"decoder_layers.{i}.self_attention.qkv.weight"] = t
+
+        t = model_params["decoder.blocks." + str(i) + ".attn.out.weight"].contiguous()
+        weights[f"decoder_layers.{i}.self_attention.dense.weight"] = t
+
+        bias_shape = model_params["decoder.blocks." + str(i) + ".attn.query.bias"].shape
+        dtype = model_params["decoder.blocks." + str(i) + ".attn.query.bias"].dtype
+        weights[f"decoder_layers.{i}.self_attention.qkv.bias"] = torch.cat(
+            [
+                model_params["decoder.blocks." + str(i) + ".attn.query.bias"],
+                torch.zeros([*bias_shape], dtype=dtype),
+                model_params["decoder.blocks." + str(i) + ".attn.value.bias"],
+            ],
+            dim=0,
+        )
+        weights[f"decoder_layers.{i}.self_attention.dense.bias"] = model_params[
+            "decoder.blocks." + str(i) + ".attn.out.bias"
+        ]
+
+        weights[f"decoder_layers.{i}.self_attention_layernorm.weight"] = model_params[
+            "decoder.blocks." + str(i) + ".attn_ln.weight"
+        ]
+        weights[f"decoder_layers.{i}.self_attention_layernorm.bias"] = model_params[
+            "decoder.blocks." + str(i) + ".attn_ln.bias"
+        ]
+
+        t = torch.cat(
+            [
+                model_params["decoder.blocks." + str(i) + ".cross_attn.query.weight"],
+                model_params["decoder.blocks." + str(i) + ".cross_attn.key.weight"],
+                model_params["decoder.blocks." + str(i) + ".cross_attn.value.weight"],
+            ],
+            dim=0,
+        )
+        weights[f"decoder_layers.{i}.cross_attention.qkv.weight"] = t
+
+        t = model_params[
+            "decoder.blocks." + str(i) + ".cross_attn.out.weight"
+        ].contiguous()
+        weights[f"decoder_layers.{i}.cross_attention.dense.weight"] = t
+
+        bias_shape = model_params[
+            "decoder.blocks." + str(i) + ".cross_attn.query.bias"
+        ].shape
+        dtype = model_params[
+            "decoder.blocks." + str(i) + ".cross_attn.query.bias"
+        ].dtype
+        cross_attn_qkv_bias = torch.cat(
+            [
+                model_params["decoder.blocks." + str(i) + ".cross_attn.query.bias"],
+                torch.zeros([*bias_shape], dtype=dtype),
+                model_params["decoder.blocks." + str(i) + ".cross_attn.value.bias"],
+            ],
+            dim=0,
         )
 
-        tensorrt_llm_whisper_decoder(*inputs)
+        weights[f"decoder_layers.{i}.cross_attention.qkv.bias"] = cross_attn_qkv_bias
 
-        if args.debug_mode:
-            for k, v in tensorrt_llm_whisper_decoder.named_network_outputs():
-                network._mark_output(v, k, str_dtype_to_trt(args.dtype))
+        weights[f"decoder_layers.{i}.cross_attention.dense.bias"] = model_params[
+            "decoder.blocks." + str(i) + ".cross_attn.out.bias"
+        ]
 
-    engine = None
-    engine = builder.build_engine(network, builder_config)
+        weights[f"decoder_layers.{i}.cross_attention_layernorm.weight"] = model_params[
+            "decoder.blocks." + str(i) + ".cross_attn_ln.weight"
+        ]
+        weights[f"decoder_layers.{i}.cross_attention_layernorm.bias"] = model_params[
+            "decoder.blocks." + str(i) + ".cross_attn_ln.bias"
+        ]
 
-    config_path = os.path.join(args.output_dir, 'decoder_config.json')
-    builder.save_config(builder_config, config_path)
+        t = model_params["decoder.blocks." + str(i) + ".mlp.0.weight"].contiguous()
+        weights[f"decoder_layers.{i}.mlp.fc.weight"] = t
 
-    serialize_engine(engine, os.path.join(args.output_dir, "decoder.engine"))
+        t = model_params["decoder.blocks." + str(i) + ".mlp.2.weight"].contiguous()
+        weights[f"decoder_layers.{i}.mlp.proj.weight"] = t
+
+        weights[f"decoder_layers.{i}.mlp.fc.bias"] = model_params[
+            "decoder.blocks." + str(i) + ".mlp.0.bias"
+        ]
+        weights[f"decoder_layers.{i}.mlp.proj.bias"] = model_params[
+            "decoder.blocks." + str(i) + ".mlp.2.bias"
+        ]
+
+        weights[f"decoder_layers.{i}.mlp_layernorm.weight"] = model_params[
+            "decoder.blocks." + str(i) + ".mlp_ln.weight"
+        ]
+        weights[f"decoder_layers.{i}.mlp_layernorm.bias"] = model_params[
+            "decoder.blocks." + str(i) + ".mlp_ln.bias"
+        ]
+
+    weights["final_layernorm.weight"] = model_params["decoder.ln.weight"]
+    weights["final_layernorm.bias"] = model_params["decoder.ln.bias"]
+
+    return weight_only_quantize_dict(weights, quant_algo=quant_algo, plugin=True)  # type: ignore
 
 
-def run(args=None, log_level='error'):
+def convert_checkpoints(args):
+    tik = time.time()
 
-    logger.set_level(log_level)
-        
-    if args.use_weight_only_enc:
-        args.quant_mode_enc = QuantMode.from_description(
-            quantize_weights=True,
-            quantize_activations=False,
-            use_int4_weights="int4" in args.weight_only_precision)
-    else:
-        args.quant_mode_enc = QuantMode(0)
+    if not os.path.exists(args.checkpoint_dir):
+        os.makedirs(args.checkpoint_dir)
 
-    if args.use_weight_only_dec:
-        args.quant_mode_dec = QuantMode.from_description(
-            quantize_weights=True,
-            quantize_activations=False,
-            use_int4_weights="int4" in args.weight_only_precision)
-    else:
-        args.quant_mode_dec = QuantMode(0)
+    quant_algo = None
+    if args.use_weight_only and args.weight_only_precision == "int8":
+        quant_algo = QuantAlgo.W8A16
+    elif args.use_weight_only and args.weight_only_precision == "int4":
+        quant_algo = QuantAlgo.W4A16
+    elif args.use_weight_only and args.weight_only_precision == "int4_gptq":
+        quant_algo = QuantAlgo.W4A16_GPTQ
 
-    if args.int8_kv_cache:
-        args.quant_mode_dec = args.quant_mode.set_int8_kv_cache()
+    model_dir = os.path.join(args.model_dir, args.model_name + ".pt")
+    assert os.path.exists(model_dir), f"Model {model_dir} does not exist."
 
-    model = torch.load(args.model_path)
+    model = torch.load(model_dir, map_location="cpu")
+    print(f"Loaded model from {model_dir}")
+    model_metadata = model["dims"]
+    model_state_dict = model["model_state_dict"]
 
-    _t = time.time()
-    build_encoder(model, args)    
-    _te = time.time()-_t
+    def convert_and_save(component: str = "encoder"):
+        # call get_encoder_config or get_decoder_config according to component
+        if component == "encoder":
+            config = get_encoder_config(model_metadata, args.dtype, quant_algo)  # type: ignore
+        else:
+            config = get_decoder_config(
+                model_metadata, args.dtype, args.logits_dtype, quant_algo  # type: ignore
+            )
 
-    _t = time.time()
-    build_decoder(model, args)
-    _td = time.time()-_t
+        if args.use_weight_only and args.weight_only_precision == "int4_gptq":
+            config["quantization"].update(
+                {
+                    "has_zero_point": True,
+                }
+            )
 
-    print(f"Time taken for building Encoder: {_te:.2f} seconds.")
-    print(f"Time taken for building Decoder: {_td:.2f} seconds.")
-    print(f"Exported model size: {get_export_size(args.output_dir)}")
-    
+        component_save_dir = os.path.join(args.checkpoint_dir, component)
+        if not os.path.exists(component_save_dir):
+            os.makedirs(component_save_dir)
 
-if __name__ == '__main__':
-    parser = argparse.ArgumentParser()
-    parser.add_argument('--output_dir', type=str)
-    parser.add_argument('--log_level', type=str)
-    args = parser.parse_args()
+        with open(os.path.join(component_save_dir, "config.json"), "w") as f:
+            json.dump(config, f, indent=4)
+
+        if component == "encoder":
+            weights = convert_openai_whisper_encoder(
+                model_metadata, model_state_dict, quant_algo=quant_algo
+            )
+        else:
+            assert component == "decoder"
+            weights = convert_openai_whisper_decoder(
+                model_metadata, model_state_dict, quant_algo=quant_algo
+            )
+
+        save_file(weights, os.path.join(component_save_dir, f"rank0.safetensors"))
+
+    print("Converting encoder checkpoints...")
+    convert_and_save("encoder")
+    print("Converting decoder checkpoints...")
+    convert_and_save("decoder")
+
+    tok = time.time()
+    t = time.strftime("%H:%M:%S", time.gmtime(tok - tik))
+    print(f"Total time of converting checkpoints: {t}")
+
+
+def run_build(args):
+    if not os.path.exists(args.output_dir):
+        os.makedirs(args.output_dir)
+
+    encoder_build_cmd = f"trtllm-build  \
+        --checkpoint_dir {args.checkpoint_dir}/encoder \
+        --output_dir {args.output_dir}/encoder \
+        --moe_plugin disable \
+        --enable_xqa disable \
+        --max_batch_size {args.max_batch_size} \
+        --max_input_len {args.max_input_len_enc} \
+        --max_seq_len {args.max_input_len_enc} "
+
+    if args.use_gemm_plugin:
+        encoder_build_cmd += f"--gemm_plugin {args.use_gemm_plugin} "
+    if args.use_bert_attention_plugin:
+        encoder_build_cmd += (
+            f"--bert_attention_plugin {args.use_bert_attention_plugin} "
+        )
+    if args.use_context_fmha_enc:
+        encoder_build_cmd += "--use_fp8_context_fmha enable "
+    if not args.remove_input_padding:
+        encoder_build_cmd += "--remove_input_padding disable "
+
+    out_logs = os.popen(encoder_build_cmd).read().split("\n")
+    # for line in out_logs:
+    #     print(line)
+
+    decoder_build_cmd = f"trtllm-build  \
+        --checkpoint_dir {args.checkpoint_dir}/decoder \
+        --output_dir {args.output_dir}/decoder \
+        --moe_plugin disable \
+        --enable_xqa disable \
+        --max_beam_width {args.max_beam_width} \
+        --max_batch_size {args.max_batch_size} \
+        --max_seq_len {args.max_output_len} \
+        --max_input_len {args.max_input_len_dec} \
+        --max_encoder_input_len {args.max_input_len_enc} "
+
+    if args.use_gemm_plugin:
+        decoder_build_cmd += f"--gemm_plugin {args.use_gemm_plugin} "
+    if args.use_bert_attention_plugin:
+        decoder_build_cmd += (
+            f"--bert_attention_plugin {args.use_bert_attention_plugin} "
+        )
+    if args.use_gpt_attention_plugin:
+        decoder_build_cmd += f"--bert_attention_plugin {args.use_gpt_attention_plugin} "
+    if args.use_context_fmha_dec:
+        decoder_build_cmd += "--use_fp8_context_fmha enable "
+    if not args.remove_input_padding:
+        decoder_build_cmd += "--remove_input_padding disable "
+
+    out_logs = os.popen(decoder_build_cmd).read().split("\n")
+    # for line in out_logs:
+    #     print(line)
+
+
+def run(args):
+    convert_checkpoints(args)
+    run_build(args)
+
+
+if __name__ == "__main__":
+    args = parse_arguments()
 
     trt_build_args = load_trt_build_config(args.output_dir)
 
     print(f"[TRTBuilderConfig]:")
     print(vars(trt_build_args))
-    
-    run(args=trt_build_args, log_level=args.log_level)
+
+    run(args=trt_build_args)
