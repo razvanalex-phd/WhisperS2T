@@ -18,6 +18,7 @@
 import json
 from collections import OrderedDict
 from pathlib import Path
+from typing import Any
 
 import tensorrt_llm
 import torch
@@ -26,13 +27,17 @@ from tensorrt_llm.bindings import GptJsonConfig, KVCacheType
 from tensorrt_llm.runtime import PYTHON_BINDINGS, ModelConfig, SamplingConfig
 from tensorrt_llm.runtime.session import Session, TensorInfo
 
-from .engine_builder import load_trt_build_config
+from whisper_s2t.backends.tensorrt.engine_builder import load_trt_build_config
 
 if PYTHON_BINDINGS:
     from tensorrt_llm.runtime import ModelRunnerCpp
 
 
-def remove_tensor_padding(input_tensor, input_tensor_lengths=None, pad_value=0):
+def remove_tensor_padding(
+    input_tensor: torch.Tensor,
+    input_tensor_lengths: torch.Tensor | None = None,
+    pad_value: int = 0,
+) -> torch.Tensor:
     if input_tensor.dim() == 2:
         # Text tensor case: batch, seq_len
         assert torch.all(
@@ -51,7 +56,7 @@ def remove_tensor_padding(input_tensor, input_tensor_lengths=None, pad_value=0):
         assert (
             input_tensor_lengths is not None
         ), "input_tensor_lengths must be provided for 3D input_tensor"
-        batch_size, seq_len, feature_len = input_tensor.shape
+        batch_size, _seq_len, _feature_len = input_tensor.shape
 
         # Initialize a list to collect valid sequences
         valid_sequences = []
@@ -69,7 +74,7 @@ def remove_tensor_padding(input_tensor, input_tensor_lengths=None, pad_value=0):
     return output_tensor
 
 
-def read_config(component, engine_dir):
+def read_config(component: str, engine_dir: Path) -> OrderedDict:
     config_path = engine_dir / component / "config.json"
     with open(config_path, "r") as f:
         config = json.load(f)
@@ -81,21 +86,26 @@ def read_config(component, engine_dir):
 
 class WhisperEncoding:
 
-    def __init__(self, engine_dir):
-        self.session = self.get_session(engine_dir)
+    def __init__(self, engine_dir: Path) -> None:
+        self.session: Session = self.get_session(engine_dir)
         config = read_config("encoder", engine_dir)
-        self.n_mels = config["n_mels"]
-        self.dtype = config["dtype"]
-        self.num_languages = config["num_languages"]
-        self.encoder_config = config
+        self.n_mels: int = config["n_mels"]
+        self.dtype: str = config["dtype"]
+        self.num_languages: int = config["num_languages"]
+        self.encoder_config: OrderedDict = config
 
-    def get_session(self, engine_dir):
+    def get_session(self, engine_dir: Path) -> Session:
         serialize_path = engine_dir / "encoder" / "rank0.engine"
         with open(serialize_path, "rb") as f:
             session = Session.from_serialized_engine(f.read())
         return session
 
-    def get_audio_features(self, mel, mel_input_lengths, encoder_downsampling_factor=2):
+    def get_audio_features(
+        self,
+        mel: torch.Tensor,
+        mel_input_lengths: torch.Tensor,
+        encoder_downsampling_factor: int = 2,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         if self.encoder_config["plugin_config"]["remove_input_padding"]:
             # mel B,D,T -> B,T,D -> BxT, D
             mel = mel.transpose(1, 2)
@@ -132,14 +142,23 @@ class WhisperEncoding:
 
 class WhisperDecoding:
 
-    def __init__(self, engine_dir, runtime_mapping, debug_mode=False):
-
-        self.decoder_config = read_config("decoder", engine_dir)
-        self.decoder_generation_session = self.get_session(
-            engine_dir, runtime_mapping, debug_mode
+    def __init__(
+        self,
+        engine_dir: Path,
+        runtime_mapping: tensorrt_llm.Mapping,
+        debug_mode: bool = False,
+    ) -> None:
+        self.decoder_config: OrderedDict = read_config("decoder", engine_dir)
+        self.decoder_generation_session: tensorrt_llm.runtime.GenerationSession = (
+            self.get_session(engine_dir, runtime_mapping, debug_mode)
         )
 
-    def get_session(self, engine_dir, runtime_mapping, debug_mode=False):
+    def get_session(
+        self,
+        engine_dir: Path,
+        runtime_mapping: tensorrt_llm.Mapping,
+        debug_mode: bool = False,
+    ) -> tensorrt_llm.runtime.GenerationSession:
         serialize_path = engine_dir / "decoder" / "rank0.engine"
         with open(serialize_path, "rb") as f:
             decoder_engine_buffer = f.read()
@@ -179,19 +198,19 @@ class WhisperDecoding:
 
     def generate(
         self,
-        decoder_input_ids,
-        encoder_outputs,
-        encoder_max_input_length,
-        encoder_input_lengths,
-        eot_id,
-        max_new_tokens=40,
-        num_beams=1,
-        stop_words_list=None,
-        bad_words_list=None,
-        temperature=1,
-        length_penalty=1,
-        repetition_penalty=1,
-    ):
+        decoder_input_ids: torch.Tensor,
+        encoder_outputs: torch.Tensor,
+        encoder_max_input_length: int,
+        encoder_input_lengths: torch.Tensor,
+        eot_id: int,
+        max_new_tokens: int = 40,
+        num_beams: int = 1,
+        stop_words_list: list[list[int]] | None = None,
+        bad_words_list: list[list[int]] | None = None,
+        temperature: float = 1,
+        length_penalty: float = 1,
+        repetition_penalty: float = 1,
+    ) -> list[list[int]]:
         batch_size = decoder_input_ids.shape[0]
         decoder_input_lengths = torch.tensor(
             [decoder_input_ids.shape[-1] for _ in range(decoder_input_ids.shape[0])],
@@ -262,10 +281,10 @@ class WhisperTRT:
 
     def __init__(
         self,
-        engine_dir,
-        debug_mode=False,
-        assets_dir=None,
-        use_py_session=False,
+        engine_dir: str | Path,
+        debug_mode: bool = False,
+        assets_dir: str | Path | None = None,
+        use_py_session: bool = False,
     ):
         world_size = 1
         runtime_rank = tensorrt_llm.mpi_rank()
@@ -303,19 +322,19 @@ class WhisperTRT:
 
     def process_batch(
         self,
-        mel,
-        mel_input_lengths,
-        prompt,
-        num_beams=1,
-        max_new_tokens=96,
-        end_id=0,
-        pad_id=0,
-        stop_words_list=None,
-        bad_words_list=None,
-        temperature=1,
-        length_penalty=1,
-        repetition_penalty=1,
-    ):
+        mel: torch.Tensor,
+        mel_input_lengths: torch.Tensor,
+        prompt: list[torch.Tensor],
+        num_beams: int = 1,
+        max_new_tokens: int = 96,
+        end_id: int = 0,
+        pad_id: int = 0,
+        stop_words_list: list[list[int]] | None = None,
+        bad_words_list: list[list[int]] | None = None,
+        temperature: float = 1,
+        length_penalty: float = 1,
+        repetition_penalty: float = 1,
+    ) -> list[list[int]]:
         if self.use_py_session:
             encoder_output, encoder_output_lengths = self.encoder.get_audio_features(
                 mel, mel_input_lengths
@@ -347,9 +366,8 @@ class WhisperTRT:
                     num_beams=num_beams,
                     output_sequence_lengths=True,
                     return_dict=True,
-                    # FIXME: not working because of bad type. Should be list[list[int]].
-                    # bad_words_list=bad_words_list,
-                    # stop_words_list=stop_words_list,
+                    bad_words_list=bad_words_list,
+                    stop_words_list=stop_words_list,
                     temperature=temperature,
                     length_penalty=length_penalty,
                     repetition_penalty=repetition_penalty,
@@ -358,7 +376,10 @@ class WhisperTRT:
                 output_ids = outputs["output_ids"].cpu().numpy().tolist()  # type: ignore
         return output_ids
 
-    def encode(self, mel):
+    def encode(
+        self,
+        mel: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         mel_input_lengths = torch.full(
             (mel.shape[0],),
             mel.shape[2],
@@ -370,7 +391,12 @@ class WhisperTRT:
             mel_input_lengths,
         )
 
-    def generate(self, features, prompts, **generate_kwargs):
+    def generate(
+        self,
+        features: torch.Tensor,
+        prompts: list[list[int]],
+        **generate_kwargs: Any,
+    ) -> list[list[int]]:
         features_lengths = torch.full(
             (features.shape[0],),
             features.shape[2],

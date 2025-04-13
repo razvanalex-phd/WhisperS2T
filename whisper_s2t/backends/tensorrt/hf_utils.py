@@ -2,12 +2,12 @@
 
 import os
 import re
-from typing import List, Optional
+from typing import List
 
 import huggingface_hub
 import requests
 
-from ... import CACHE_DIR
+from whisper_s2t import CACHE_DIR
 
 os.makedirs(f"{CACHE_DIR}/models", exist_ok=True)
 
@@ -35,10 +35,10 @@ def available_models() -> List[str]:
 
 def download_model(
     size_or_id: str,
-    output_dir: Optional[str] = None,
+    output_dir: str | None = None,
     local_files_only: bool = False,
-    cache_dir: Optional[str] = None,
-):
+    cache_dir: str | None = None,
+) -> str:
     """Downloads a CTranslate2 Whisper model from the Hugging Face Hub.
 
     Args:
@@ -92,17 +92,20 @@ def download_model(
     try:
         return huggingface_hub.snapshot_download(repo_id, **kwargs)
     except (
-        huggingface_hub.utils.HfHubHTTPError,
+        huggingface_hub.error.HfHubHTTPError,
         requests.exceptions.ConnectionError,
     ) as exception:
+        import warnings
+
         print(exception)
-        logger = get_logger()
-        logger.warning(
-            "An error occured while synchronizing the model %s from the Hugging Face Hub:\n%s",
-            repo_id,
-            exception,
+
+        warnings.warn(
+            "An error occured while synchronizing the model %s from the Hugging Face Hub:\n%s".format(
+                repo_id,
+                exception,
+            )
         )
-        logger.warning(
+        warnings.warn(
             "Trying to load the model directly from the local cache, if it exists."
         )
 

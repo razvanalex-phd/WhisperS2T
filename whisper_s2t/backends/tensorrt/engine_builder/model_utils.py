@@ -20,7 +20,7 @@ from collections import defaultdict
 from functools import lru_cache
 from pathlib import Path
 from subprocess import CalledProcessError, run
-from typing import Dict, Iterable, List, Optional, TextIO, Tuple, Union
+from typing import Iterable, TextIO
 
 import kaldialign
 import numpy as np
@@ -28,7 +28,7 @@ import soundfile
 import torch
 import torch.nn.functional as F
 
-Pathlike = Union[str, Path]
+Pathlike = str | Path
 
 SAMPLE_RATE = 16000
 N_FFT = 400
@@ -37,7 +37,7 @@ CHUNK_LENGTH = 30
 N_SAMPLES = CHUNK_LENGTH * SAMPLE_RATE  # 480000 samples in a 30-second chunk
 
 
-def sinusoids(length, channels, max_timescale=10000):
+def sinusoids(length: int, channels: int, max_timescale: int = 10000) -> torch.Tensor:
     """Returns sinusoids for positional embedding"""
     assert channels % 2 == 0
     log_timescale_increment = np.log(max_timescale) / (channels // 2 - 1)
@@ -46,7 +46,7 @@ def sinusoids(length, channels, max_timescale=10000):
     return torch.cat([torch.sin(scaled_time), torch.cos(scaled_time)], dim=1)
 
 
-def load_audio(file: str, sr: int = SAMPLE_RATE):
+def load_audio(file: str, sr: int = SAMPLE_RATE) -> np.ndarray:
     """
     Open an audio file and read as mono waveform, resampling as necessary
 
@@ -80,7 +80,7 @@ def load_audio(file: str, sr: int = SAMPLE_RATE):
     return np.frombuffer(out, np.int16).flatten().astype(np.float32) / 32768.0
 
 
-def load_audio_wav_format(wav_path):
+def load_audio_wav_format(wav_path: str) -> tuple[np.ndarray, int]:
     # make sure audio in .wav format
     assert wav_path.endswith(".wav"), f"Only support .wav format, but got {wav_path}"
     waveform, sample_rate = soundfile.read(wav_path)
@@ -88,7 +88,12 @@ def load_audio_wav_format(wav_path):
     return waveform, sample_rate
 
 
-def pad_or_trim(array, length: int = N_SAMPLES, *, axis: int = -1):
+def pad_or_trim(
+    array: np.ndarray | torch.Tensor,
+    length: int = N_SAMPLES,
+    *,
+    axis: int = -1,
+) -> np.ndarray | torch.Tensor:
     """
     Pad or trim the audio array to N_SAMPLES, as expected by the encoder.
     """
@@ -115,7 +120,11 @@ def pad_or_trim(array, length: int = N_SAMPLES, *, axis: int = -1):
 
 
 @lru_cache(maxsize=None)
-def mel_filters(device, n_mels: int, mel_filters_dir: str = None) -> torch.Tensor:
+def mel_filters(
+    device: str | torch.device | None,
+    n_mels: int,
+    mel_filters_dir: str | None = None,
+) -> torch.Tensor:
     """
     load the mel filterbank matrix for projecting STFT into a Mel spectrogram.
     Allows decoupling librosa dependency; saved using:
@@ -137,19 +146,19 @@ def mel_filters(device, n_mels: int, mel_filters_dir: str = None) -> torch.Tenso
 
 
 def log_mel_spectrogram(
-    audio: Union[str, np.ndarray, torch.Tensor],
+    audio: str | np.ndarray | torch.Tensor,
     n_mels: int,
     padding: int = 0,
-    device: Optional[Union[str, torch.device]] = None,
+    device: str | torch.device | None = None,
     return_duration: bool = False,
-    mel_filters_dir: str = None,
-):
+    mel_filters_dir: str | None = None,
+) -> torch.Tensor | tuple[torch.Tensor, float]:
     """
     Compute the log-Mel spectrogram of
 
     Parameters
     ----------
-    audio: Union[str, np.ndarray, torch.Tensor], shape = (*)
+    audio: str | np.ndarray | torch.Tensor, shape = (*)
         The path to audio or either a NumPy array or Tensor containing the audio waveform in 16 kHz
 
     n_mels: int
@@ -158,7 +167,7 @@ def log_mel_spectrogram(
     padding: int
         Number of zero samples to pad to the right
 
-    device: Optional[Union[str, torch.device]]
+    device: str | torch.device | None
         If given, the audio tensor is moved to this device before STFT
 
     Returns
@@ -175,8 +184,8 @@ def log_mel_spectrogram(
         assert isinstance(audio, np.ndarray), f"Unsupported audio type: {type(audio)}"
         duration = audio.shape[-1] / SAMPLE_RATE
         audio = pad_or_trim(audio, N_SAMPLES)
-        audio = audio.astype(np.float32)
         audio = torch.from_numpy(audio)
+        audio = audio.to(device, dtype=torch.float32)
 
     if device is not None:
         audio = audio.to(device)
@@ -192,14 +201,16 @@ def log_mel_spectrogram(
     log_spec = torch.clamp(mel_spec, min=1e-10).log10()
     log_spec = torch.maximum(log_spec, log_spec.max() - 8.0)
     log_spec = (log_spec + 4.0) / 4.0
+
     if return_duration:
-        return log_spec, duration
+        return log_spec, duration  # type: ignore
     else:
         return log_spec
 
 
 def store_transcripts(
-    filename: Pathlike, texts: Iterable[Tuple[str, str, str]]
+    filename: Pathlike,
+    texts: Iterable[tuple[str, str, str]],
 ) -> None:
     """Save predicted results and reference transcripts to a file.
     https://github.com/k2-fsa/icefall/blob/master/icefall/utils.py
@@ -221,7 +232,7 @@ def store_transcripts(
 def write_error_stats(
     f: TextIO,
     test_set_name: str,
-    results: List[Tuple[str, str]],
+    results: list[tuple[str, str, str]],
     enable_log: bool = True,
 ) -> float:
     """Write statistics based on predicted results and reference transcripts.
@@ -258,13 +269,13 @@ def write_error_stats(
     Returns:
       Return None.
     """
-    subs: Dict[Tuple[str, str], int] = defaultdict(int)
-    ins: Dict[str, int] = defaultdict(int)
-    dels: Dict[str, int] = defaultdict(int)
+    subs: dict[tuple[str, str], int] = defaultdict(int)
+    ins: dict[str, int] = defaultdict(int)
+    dels: dict[str, int] = defaultdict(int)
 
     # `words` stores counts per word, as follows:
     #   corr, ref_sub, hyp_sub, ins, dels
-    words: Dict[str, List[int]] = defaultdict(lambda: [0, 0, 0, 0, 0])
+    words: dict[str, list[int]] = defaultdict(lambda: [0, 0, 0, 0, 0])
     num_corr = 0
     ERR = "*"
     for cut_id, ref, hyp in results:
@@ -312,6 +323,7 @@ def write_error_stats(
 
     print("", file=f)
     print("PER-UTT DETAILS: corr or (ref->hyp)  ", file=f)
+
     for cut_id, ref, hyp in results:
         ali = kaldialign.align(ref, hyp, ERR)
         combine_successive_errors = True
@@ -367,6 +379,7 @@ def write_error_stats(
 
     print("", file=f)
     print("PER-WORD STATS: word  corr tot_errs count_in_ref count_in_hyp", file=f)
+
     for _, word, counts in sorted(
         [(sum(v[1:]), k, v) for k, v in words.items()], reverse=True
     ):

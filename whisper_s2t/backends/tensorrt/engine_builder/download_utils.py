@@ -5,7 +5,7 @@ import warnings
 
 from tqdm import tqdm
 
-from .... import CACHE_DIR
+from whisper_s2t import CACHE_DIR
 
 SAVE_DIR = f"{CACHE_DIR}/models/trt"
 os.makedirs(SAVE_DIR, exist_ok=True)
@@ -21,7 +21,7 @@ _TOKENIZER = {
 }
 
 
-def download_model(name):
+def download_model(name) -> tuple[str, str]:
     url = _MODELS[name]
     expected_sha256 = url.split("/")[-2]
 
