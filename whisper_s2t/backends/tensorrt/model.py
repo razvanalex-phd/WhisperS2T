@@ -1,17 +1,23 @@
 import os
+from typing import Any
 
 import ctranslate2
 import numpy as np
 import tokenizers
+import torch
 
-from ...configs import *
-from .. import WhisperModel
-from .engine_builder import TRTBuilderConfig, build_trt_engine, load_trt_build_config
-from .hf_utils import download_model
-from .tokenizer import Tokenizer
-from .trt_model import WhisperTRT
+from whisper_s2t.backends import WhisperModel
+from whisper_s2t.backends.tensorrt.engine_builder import (
+    TRTBuilderConfig,
+    build_trt_engine,
+    load_trt_build_config,
+)
+from whisper_s2t.backends.tensorrt.hf_utils import download_model
+from whisper_s2t.backends.tensorrt.tokenizer import Tokenizer
+from whisper_s2t.backends.tensorrt.trt_model import WhisperTRT
+from whisper_s2t.configs import *
 
-FAST_ASR_OPTIONS = {
+FAST_ASR_OPTIONS: dict[str, Any] = {
     "beam_size": 1,
     "best_of": 1,  # Placeholder
     "patience": 1,
@@ -34,7 +40,7 @@ FAST_ASR_OPTIONS = {
 }
 
 
-BEST_ASR_CONFIG = {
+BEST_ASR_CONFIG: dict[str, Any] = {
     "beam_size": 5,
     "best_of": 1,  # Placeholder
     "patience": 2,
@@ -61,16 +67,15 @@ class WhisperModelTRT(WhisperModel):
     def __init__(
         self,
         model_name_or_path: str,
-        cpu_threads=4,
-        num_workers=1,
-        device="cuda",
-        device_index=0,
-        compute_type="float16",
-        max_text_token_len=MAX_TEXT_TOKEN_LENGTH,
-        asr_options={},
-        **model_kwargs,
-    ):
-
+        cpu_threads: int = 4,
+        num_workers: int = 1,
+        device: str = "cuda",
+        device_index: int = 0,
+        compute_type: str = "float16",
+        max_text_token_len: int = MAX_TEXT_TOKEN_LENGTH,
+        asr_options: dict[str, Any] = {},
+        **model_kwargs: Any,
+    ) -> None:
         # ASR Options
         self.asr_options = FAST_ASR_OPTIONS
         self.asr_options.update(asr_options)
@@ -157,7 +162,7 @@ class WhisperModelTRT(WhisperModel):
         )
         self.tokenizer: Tokenizer
 
-    def update_generation_kwargs(self, params={}):
+    def update_generation_kwargs(self, params: dict[str, Any] = {}) -> None:
         self.generate_kwargs.update(params)
 
         if "max_text_token_len" in params:
@@ -165,14 +170,20 @@ class WhisperModelTRT(WhisperModel):
                 params={"max_text_token_len": params["max_text_token_len"]}
             )
 
-    def encode(self, features):
+    def encode(self, features: torch.Tensor) -> tuple:
         """
         [Not Used]
         """
 
         return self.model.encode(features)
 
-    def assign_word_timings(self, alignments, text_token_probs, words, word_tokens):
+    def assign_word_timings(
+        self,
+        alignments: list[tuple[int, int]],
+        text_token_probs: list[float],
+        words: list[str],
+        word_tokens: list,
+    ) -> list[dict[str, float | str]]:
         text_indices = np.array([pair[0] for pair in alignments])
         time_indices = np.array([pair[1] for pair in alignments])
 
@@ -194,14 +205,23 @@ class WhisperModelTRT(WhisperModel):
 
         return [
             dict(
-                word=word, start=round(start, 2), end=round(end, 2), prob=round(prob, 2)
+                word=word,
+                start=int(round(start, 2)),
+                end=int(round(end, 2)),
+                prob=int(round(prob, 2)),
             )
             for word, start, end, prob in zip(words, start_times, end_times, word_probs)
         ]
 
     def align_words(
-        self, features, texts, text_tokens, sot_seqs, seq_lens, seg_metadata
-    ):
+        self,
+        features: torch.Tensor,
+        texts: list[str],
+        text_tokens: list[list[int]],
+        sot_seqs: list[tuple[int, ...]],
+        seq_lens: torch.Tensor,
+        seg_metadata: list[dict[str, Any]],
+    ) -> list[list[dict[str, Any]]]:
         lang_codes = [_["lang_code"] for _ in seg_metadata]
         word_tokens = self.tokenizer.split_to_word_tokens_batch(
             texts, text_tokens, lang_codes
@@ -259,15 +279,15 @@ class WhisperModelTRT(WhisperModel):
 
     def generate_segment_batched(
         self,
-        features,
-        prompts,
-        seq_lens,
-        seg_metadata,
+        features: torch.Tensor,
+        prompts: list[list[int]],
+        seq_lens: torch.Tensor,
+        seg_metadata: list[dict[str, Any]],
         *,
-        align_features,
-        align_seq_lens,
-        **kwargs,
-    ):
+        align_features: torch.Tensor,
+        align_seq_lens: torch.Tensor,
+        **kwargs: Any,
+    ) -> list[dict[str, Any]]:
         if self.compute_type == "float16":
             features = features.half()
 
@@ -280,7 +300,7 @@ class WhisperModelTRT(WhisperModel):
         texts = self.tokenizer.decode_batch([x[0] for x in result])
 
         response = []
-        for idx, r in enumerate(result):
+        for idx, _r in enumerate(result):
             response.append({"text": texts[idx].strip()})
 
         if self.asr_options["word_timestamps"]:

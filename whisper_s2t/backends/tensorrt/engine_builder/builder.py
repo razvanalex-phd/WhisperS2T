@@ -19,6 +19,7 @@ import argparse
 import json
 import os
 import time
+from argparse import Namespace
 
 import torch
 from safetensors.torch import save_file
@@ -26,11 +27,14 @@ from tensorrt_llm.functional import LayerNormPositionType, LayerNormType
 from tensorrt_llm.models.convert_utils import weight_only_quantize_dict
 from tensorrt_llm.quantization import QuantAlgo
 
-from . import load_trt_build_config
-from .model_utils import sinusoids
+from whisper_s2t.backends.tensorrt.engine_builder import (
+    TRTBuilderConfig,
+    load_trt_build_config,
+)
+from whisper_s2t.backends.tensorrt.engine_builder.model_utils import sinusoids
 
 
-def parse_arguments():
+def parse_arguments() -> Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument("--model_dir", type=str, default="assets")
     parser.add_argument("--quant_ckpt_path", type=str, default=None)
@@ -156,9 +160,9 @@ def get_decoder_config(
 
 def convert_openai_whisper_encoder(
     model_metadata: dict,
-    model_params: dict,
+    model_params: dict[str, torch.Tensor],
     quant_algo: QuantAlgo | None = None,
-):
+) -> dict[str, torch.Tensor]:
     weights = {}
 
     weights["positional_embedding"] = sinusoids(
@@ -175,7 +179,7 @@ def convert_openai_whisper_encoder(
     weights["conv2.bias"] = model_params["encoder.conv2.bias"].contiguous()
 
     # Encoder conv needs to run in fp32 on Volta/Turing
-    major, minor = torch.cuda.get_device_capability()
+    major, _minor = torch.cuda.get_device_capability()
     if not major >= 8:
         weights["conv1.weight"] = weights["conv1.weight"].float()
         weights["conv1.bias"] = weights["conv1.bias"].float()
@@ -250,9 +254,9 @@ def convert_openai_whisper_encoder(
 
 def convert_openai_whisper_decoder(
     model_metadata: dict,
-    model_params: dict,
+    model_params: dict[str, torch.Tensor],
     quant_algo: QuantAlgo | None = None,
-):
+) -> dict[str, torch.Tensor]:
     weights = {}
 
     weights["embedding.vocab_embedding.weight"] = model_params[
@@ -367,8 +371,12 @@ def convert_openai_whisper_decoder(
     return weight_only_quantize_dict(weights, quant_algo=quant_algo, plugin=True)  # type: ignore
 
 
-def convert_checkpoints(args):
+def convert_checkpoints(args: TRTBuilderConfig) -> None:
     tik = time.time()
+
+    assert args.model_dir is not None, "Model directory must be specified."
+    assert args.checkpoint_dir is not None, "Checkpoint directory must be specified."
+    assert args.model_name is not None, "Model name must be specified."
 
     if not os.path.exists(args.checkpoint_dir):
         os.makedirs(args.checkpoint_dir)
@@ -405,6 +413,10 @@ def convert_checkpoints(args):
                 }
             )
 
+        assert (
+            args.checkpoint_dir is not None
+        ), "Checkpoint directory must be specified."
+
         component_save_dir = os.path.join(args.checkpoint_dir, component)
         if not os.path.exists(component_save_dir):
             os.makedirs(component_save_dir)
@@ -434,7 +446,9 @@ def convert_checkpoints(args):
     print(f"Total time of converting checkpoints: {t}")
 
 
-def run_build(args):
+def run_build(args: TRTBuilderConfig) -> None:
+    assert args.output_dir is not None, "Output directory must be specified."
+
     if not os.path.exists(args.output_dir):
         os.makedirs(args.output_dir)
 
@@ -491,7 +505,7 @@ def run_build(args):
     #     print(line)
 
 
-def run(args):
+def run(args: TRTBuilderConfig) -> None:
     convert_checkpoints(args)
     run_build(args)
 

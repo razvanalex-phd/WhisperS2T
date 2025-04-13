@@ -1,23 +1,27 @@
 import os
 from functools import cached_property
+from typing import Any
 
-from ... import BASE_PATH
+from whisper_s2t import BASE_PATH
 
-_TASKS = (
+_TASKS: tuple[str, ...] = (
     "transcribe",
     "translate",
 )
 
 
 with open(os.path.join(BASE_PATH, "assets/lang_codes.txt"), "r") as f:
-    _LANGUAGE_CODES = [_ for _ in f.read().split("\n") if _]
+    _LANGUAGE_CODES: list[str] = [_ for _ in f.read().split("\n") if _]
 
 
 class Tokenizer:
-    def __init__(self, tokenizer, multilingual):
+    def __init__(self, tokenizer: Any, multilingual: bool):
 
-        self.tokenizer = tokenizer
-        self.multilingual = multilingual
+        self.tokenizer: Any = tokenizer
+        self.multilingual: bool = multilingual
+
+        self.task_to_token_id: dict[str, int] | None = None
+        self.lang_code_to_token_id: dict[str, int] | None = None
 
         if self.multilingual:
             self.task_to_token_id = {
@@ -27,9 +31,6 @@ class Tokenizer:
                 lang: self.tokenizer.token_to_id(f"<|{lang}|>")
                 for lang in _LANGUAGE_CODES
             }
-        else:
-            self.task_to_token_id = None
-            self.lang_code_to_token_id = None
 
     @cached_property
     def transcribe(self) -> int:
@@ -67,7 +68,11 @@ class Tokenizer:
     def timestamp_begin(self) -> int:
         return self.no_timestamps + 1
 
-    def sot_sequence(self, task=None, lang=None):
+    def sot_sequence(
+        self,
+        task: str | None = None,
+        lang: str | None = None,
+    ) -> list[int]:
         sequence = [self.sot]
 
         if self.multilingual:
@@ -76,21 +81,25 @@ class Tokenizer:
 
         return sequence
 
-    def encode(self, text):
+    def encode(self, text: str) -> list[int]:
         return self.tokenizer.encode(text, add_special_tokens=False).ids
 
-    def decode(self, tokens):
+    def decode(self, tokens: list[int]) -> str:
         text_tokens = [token for token in tokens if token < self.eot]
         return self.tokenizer.decode(text_tokens)
 
-    def decode_batch(self, tokens):
+    def decode_batch(self, tokens: list[list[int]]) -> list[str]:
         res = []
         for tk in tokens:
             res.append([token for token in tk if token < self.eot])
 
         return self.tokenizer.decode_batch(res)
 
-    def split_tokens_on_unicode(self, text, tokens):
+    def split_tokens_on_unicode(
+        self,
+        text: str,
+        tokens: list[int],
+    ) -> tuple[list[str], list[list[int]]]:
         replacement_char = "\ufffd"
 
         subwords, subword_tokens_list, current_tokens = [], [], []
@@ -121,7 +130,11 @@ class Tokenizer:
 
         return subwords, subword_tokens_list
 
-    def split_tokens_on_spaces(self, text, tokens):
+    def split_tokens_on_spaces(
+        self,
+        text: str,
+        tokens: list[int],
+    ) -> tuple[list[str], list[list[int]]]:
         subwords, subword_tokens_list = self.split_tokens_on_unicode(text, tokens)
         words = []
         word_tokens = []
@@ -143,7 +156,12 @@ class Tokenizer:
 
         return words, word_tokens
 
-    def split_to_word_tokens(self, text, tokens, lang_code):
+    def split_to_word_tokens(
+        self,
+        text: str,
+        tokens: list[int],
+        lang_code: str,
+    ) -> tuple[list[str], list[list[int]]]:
         if lang_code in {"zh", "ja", "th", "lo", "my", "yue"}:
             # These languages don't typically use spaces, so it is difficult to split words
             # without morpheme analysis. Here, we instead split words at any
@@ -152,7 +170,12 @@ class Tokenizer:
 
         return self.split_tokens_on_spaces(text, tokens)
 
-    def split_to_word_tokens_batch(self, text_batch, tokens_batch, lang_code_batch):
+    def split_to_word_tokens_batch(
+        self,
+        text_batch: list[str],
+        tokens_batch: list[list[int]],
+        lang_code_batch: list[str],
+    ) -> list[tuple[list[str], list[list[int]]]]:
         res = []
         for text, tokens, lang_code in zip(text_batch, tokens_batch, lang_code_batch):
             res.append(self.split_to_word_tokens(text, tokens, lang_code))
