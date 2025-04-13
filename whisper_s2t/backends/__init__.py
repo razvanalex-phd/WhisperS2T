@@ -1,57 +1,67 @@
 from abc import ABC, abstractmethod
+from typing import Any, TypeVar
 
 import torch
 from tqdm import tqdm
 
-from ..audio import LogMelSpectogram
-from ..configs import *
-from ..data import WhisperDataLoader
-from ..speech_segmenter import SpeechSegmenter
+from whisper_s2t.audio import LogMelSpectogram
+from whisper_s2t.configs import *
+from whisper_s2t.data import WhisperDataLoader
+from whisper_s2t.speech_segmenter import SpeechSegmenter
+
+T = TypeVar("T")
 
 
 class NoneTokenizer:
-    def __init__(self):
-        self.sot_prev = 0
-        self.silent_token = 0
-        self.no_timestamps = 0
-        self.timestamp_begin = 0
+    def __init__(self) -> None:
+        self.sot_prev: int = 0
+        self.silent_token: int = 0
+        self.no_timestamps: int = 0
+        self.timestamp_begin: int = 0
 
-    def sot_sequence(self, task=None, lang=None):
+    def sot_sequence(
+        self,
+        task: Any | None = None,
+        lang: str | None = None,
+    ) -> list[Any]:
         return [task, lang]
 
-    def encode(self, text):
+    def encode(self, _text: str) -> list[int]:
         return [0]
 
 
-def fix_batch_param(param, default_value, N):
+def fix_batch_param(
+    param: list[T] | T | None,
+    default_value: T | None,
+    N: int,
+) -> list[T]:
     if param is None:
-        param = N * [default_value]
+        param = N * [default_value]  # type: ignore
     elif type(param) == type(default_value):
-        param = N * [param]
-    elif len(param) != N:
-        param = N * [param[0]]
+        param = N * [param]  # type: ignore
+    elif len(param) != N:  # type: ignore
+        param = N * [param[0]]  # type: ignore
 
-    return param
+    return param  # type: ignore
 
 
 class WhisperModel(ABC):
     def __init__(
         self,
-        tokenizer=None,
-        vad_model=None,
-        n_mels=80,
-        device="cuda",
-        device_index=0,
-        compute_type="float16",
-        merge_chunks=True,
-        dta_padding=3.0,
-        use_dynamic_time_axis=False,
-        max_speech_len=29.0,
-        max_text_token_len=MAX_TEXT_TOKEN_LENGTH,
-        without_timestamps=True,
-        speech_segmenter_options={},
-    ):
-
+        tokenizer: Any | None = None,
+        vad_model: Any | None = None,
+        n_mels: int = 80,
+        device: str = "cuda",
+        device_index: int = 0,
+        compute_type: str = "float16",
+        merge_chunks: bool = True,
+        dta_padding: float = 3.0,
+        use_dynamic_time_axis: bool = False,
+        max_speech_len: float = 29.0,
+        max_text_token_len: int = MAX_TEXT_TOKEN_LENGTH,
+        without_timestamps: bool = True,
+        speech_segmenter_options: dict[str, Any] = {},
+    ) -> None:
         # Configure Params
         self.device = device
         self.device_index = device_index
@@ -79,7 +89,7 @@ class WhisperModel(ABC):
 
         self._init_dependables()
 
-    def _init_dependables(self):
+    def _init_dependables(self) -> None:
         # Rescaled Params
         self.dta_padding = int(self.dta_padding * SAMPLE_RATE)
         self.max_initial_prompt_len = self.max_text_token_len // 2 - 1
@@ -106,7 +116,7 @@ class WhisperModel(ABC):
             merge_chunks=self.merge_chunks,
         )
 
-    def update_params(self, params={}):
+    def update_params(self, params: dict[str, Any] = {}) -> None:
         for key, value in params.items():
             setattr(self, key, value)
 
@@ -115,25 +125,26 @@ class WhisperModel(ABC):
     @abstractmethod
     def generate_segment_batched(
         self,
-        features,
-        prompts,
-        seq_lens,
-        seg_metadata,
-        align_features,
-        align_seq_lens,
-        **kwargs,
-    ):
+        features: torch.Tensor,
+        prompts: list[Any],
+        seq_lens: torch.Tensor,
+        seg_metadata: list[dict[str, Any]],
+        *,
+        align_features: torch.Tensor,
+        align_seq_lens: torch.Tensor,
+        **kwargs: Any,
+    ) -> list[dict[str, Any]]:
         raise NotImplemented()
 
     @torch.no_grad()
     def transcribe(
         self,
-        audio_files,
-        lang_codes=None,
-        tasks=None,
-        initial_prompts=None,
-        batch_size=8,
-    ):
+        audio_files: list[str],
+        lang_codes: list[str] | str | None = None,
+        tasks: list[str] | str | None = None,
+        initial_prompts: list[str] | str | None = None,
+        batch_size: int = 8,
+    ) -> list[list[dict[str, Any]]]:
         lang_codes = fix_batch_param(lang_codes, "en", len(audio_files))
         tasks = fix_batch_param(tasks, "transcribe", len(audio_files))
         initial_prompts = fix_batch_param(initial_prompts, None, len(audio_files))
@@ -163,8 +174,8 @@ class WhisperModel(ABC):
                     prompts,
                     seq_len,
                     seg_metadata,
-                    align_mels.to(self.device),
-                    align_seq_lens,
+                    align_features=align_mels.to(self.device),
+                    align_seq_lens=align_seq_lens,
                 )
 
                 for res_idx, _seg_metadata in enumerate(seg_metadata):
@@ -187,12 +198,12 @@ class WhisperModel(ABC):
     @torch.no_grad()
     def transcribe_with_vad(
         self,
-        audio_files,
-        lang_codes=None,
-        tasks=None,
-        initial_prompts=None,
-        batch_size=8,
-    ):
+        audio_files: list[str],
+        lang_codes: list[str] | str | None = None,
+        tasks: list[str] | str | None = None,
+        initial_prompts: list[str] | str | None = None,
+        batch_size: int = 8,
+    ) -> list[list[dict[str, Any]]]:
         lang_codes = fix_batch_param(lang_codes, "en", len(audio_files))
         tasks = fix_batch_param(tasks, "transcribe", len(audio_files))
         initial_prompts = fix_batch_param(initial_prompts, None, len(audio_files))
@@ -201,15 +212,17 @@ class WhisperModel(ABC):
 
         pbar_pos = 0
         with tqdm(total=len(audio_files) * 100, desc=f"Transcribing") as pbar:
-            for (
-                signals,
-                prompts,
-                seq_len,
-                seg_metadata,
-                pbar_update,
-            ) in self.data_loader(
-                audio_files, lang_codes, tasks, initial_prompts, batch_size=batch_size
-            ):
+            dataloader = self.data_loader(
+                audio_files,
+                lang_codes,
+                tasks,
+                initial_prompts,
+                batch_size=batch_size,
+            )
+
+            for data in dataloader:
+                signals, prompts, seq_len, seg_metadata, pbar_update = data
+
                 mels, seq_len = self.preprocessor(signals, seq_len)
                 align_mels, align_seq_lens = self.align_preprocessor(signals, seq_len)
                 res = self.generate_segment_batched(
@@ -217,8 +230,8 @@ class WhisperModel(ABC):
                     prompts,
                     seq_len,
                     seg_metadata,
-                    align_mels.to(self.device),
-                    align_seq_lens,
+                    align_features=align_mels.to(self.device),
+                    align_seq_lens=align_seq_lens,
                 )
 
                 for res_idx, _seg_metadata in enumerate(seg_metadata):

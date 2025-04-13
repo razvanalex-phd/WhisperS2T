@@ -3,18 +3,20 @@ import subprocess
 import tempfile
 import wave
 from multiprocessing.dummy import Pool
+from typing import Iterator
 
 import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from . import BASE_PATH
-from .configs import *
+from whisper_s2t import BASE_PATH
+from whisper_s2t.configs import *
 
 silent_file = f"{BASE_PATH}/assets/silent.mp3"
 
 RESAMPLING_ENGINE = "soxr"
+
 with tempfile.TemporaryDirectory() as tmpdir:
     ffmpeg_install_link = (
         "https://github.com/shashikg/WhisperS2T?tab=readme-ov-file#for-ubuntu"
@@ -47,8 +49,22 @@ with tempfile.TemporaryDirectory() as tmpdir:
             print(f"Using 'swr' resampler. This may degrade performance.")
 
 
-def load_audio(input_file, sr=16000, return_duration=False):
+def load_audio(
+    input_file: str,
+    sr: int = 16000,
+    return_duration: bool = False,
+) -> np.ndarray | tuple[np.ndarray, float]:
+    """
+    Load and preprocess an audio file.
 
+    Args:
+        input_file: Path to the audio file
+        sr: Target sample rate in Hz
+        return_duration: Whether to return the audio duration
+
+    Returns:
+        Audio signal as numpy array or tuple of (audio signal, duration in seconds)
+    """
     try:
         with wave.open(input_file, "rb") as wf:
             if (wf.getframerate() != sr) or (wf.getnchannels() != 1):
@@ -83,13 +99,37 @@ def load_audio(input_file, sr=16000, return_duration=False):
 THREAD_POOL_AUDIO_LOADER = Pool(2)
 
 
-def audio_batch_generator(audio_files):
+def audio_batch_generator(
+    audio_files: list[str],
+) -> Iterator[np.ndarray | tuple[np.ndarray, float]]:
+    """
+    Generate audio data in batches using thread pool for parallel loading.
+
+    Args:
+        audio_files: List of paths to audio files
+
+    Returns:
+        Iterator of loaded audio signals
+    """
     return THREAD_POOL_AUDIO_LOADER.imap(load_audio, audio_files)
 
 
-def pad_or_trim(array, length: int = N_SAMPLES, *, axis: int = -1):
+def pad_or_trim(
+    array: torch.Tensor | np.ndarray,
+    length: int = N_SAMPLES,
+    *,
+    axis: int = -1,
+) -> torch.Tensor | np.ndarray:
     """
     Pad or trim the audio array to N_SAMPLES, as expected by the encoder.
+
+    Args:
+        array: Audio array (torch tensor or numpy array)
+        length: Target length for the array dimension specified by axis
+        axis: Dimension to pad or trim
+
+    Returns:
+        Padded or trimmed array of the same type as input
     """
 
     if torch.is_tensor(array):
@@ -115,7 +155,7 @@ def pad_or_trim(array, length: int = N_SAMPLES, *, axis: int = -1):
 
 
 class TorchSTFT(nn.Module):
-    def __init__(self, n_fft, hop_length):
+    def __init__(self, n_fft: int, hop_length: int) -> None:
         super().__init__()
 
         self.n_fft = n_fft
@@ -124,15 +164,24 @@ class TorchSTFT(nn.Module):
         window = torch.hann_window(n_fft)
         self.register_buffer("window", window)
 
-    def forward(self, x):
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
         return torch.stft(
-            x, self.n_fft, self.hop_length, window=self.window, return_complex=True
+            x,
+            self.n_fft,
+            self.hop_length,
+            window=self.window,  # type: ignore
+            return_complex=True,
         )
 
 
 class LogMelSpectogram(nn.Module):
-    def __init__(self, n_mels=N_MELS, n_fft=N_FFT, hop_length=HOP_LENGTH, padding=0):
-
+    def __init__(
+        self,
+        n_mels: int = N_MELS,
+        n_fft: int = N_FFT,
+        hop_length: int = HOP_LENGTH,
+        padding: int = 0,
+    ) -> None:
         super().__init__()
 
         self.n_fft = n_fft
@@ -146,12 +195,16 @@ class LogMelSpectogram(nn.Module):
 
         self.stft = TorchSTFT(n_fft, hop_length)
 
-    def get_seq_len(self, seq_len):
+    def get_seq_len(self, seq_len: torch.Tensor) -> torch.Tensor:
         seq_len = torch.floor(seq_len / self.hop_length)
         return seq_len.to(dtype=torch.long)
 
     @torch.no_grad()
-    def forward(self, x, seq_len):
+    def forward(
+        self,
+        x: torch.Tensor,
+        seq_len: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
 
         seq_len = self.get_seq_len(seq_len.float())
 
@@ -164,8 +217,7 @@ class LogMelSpectogram(nn.Module):
         x = self.mel_filters @ x  # mels
 
         x = torch.clamp(x, min=1e-10).log10()  # log_mels
-        x = torch.maximum(x, torch.amax(x, dim=(1, 2), keepdims=True) - 8.0)  # clip
+        x = torch.maximum(x, torch.amax(x, dim=(1, 2), keepdim=True) - 8.0)  # clip
         x = (x + 4.0) / 4.0  # scale
 
         return x, seq_len
-

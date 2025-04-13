@@ -263,6 +263,7 @@ class WhisperModelTRT(WhisperModel):
         prompts,
         seq_lens,
         seg_metadata,
+        *,
         align_features,
         align_seq_lens,
         **kwargs,
