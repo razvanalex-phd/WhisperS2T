@@ -1,8 +1,10 @@
+from typing import Any, cast
+
 import torch
 from transformers import WhisperForConditionalGeneration, WhisperProcessor
 
-from ...configs import *
-from .. import WhisperModel
+from whisper_s2t.backends import WhisperModel
+from whisper_s2t.configs import *
 
 ASR_OPTIONS = {
     "beam_size": 1,
@@ -10,7 +12,6 @@ ASR_OPTIONS = {
     "return_scores": False,
     "return_no_speech_prob": False,
     "use_flash_attention": True,
-    "use_better_transformer": False,
 }
 
 
@@ -26,13 +27,15 @@ class WhisperModelHF(WhisperModel):
         max_text_token_len=MAX_TEXT_TOKEN_LENGTH,
         asr_options={},
         **model_kwargs,
-    ):
-
+    ) -> None:
         self.model_name = model_name
         self.asr_options = ASR_OPTIONS
         self.asr_options.update(asr_options)
 
-        self.processor = WhisperProcessor.from_pretrained(self.model_name)
+        self.processor = cast(
+            WhisperProcessor,
+            WhisperProcessor.from_pretrained(self.model_name),
+        )
         self.model = WhisperForConditionalGeneration.from_pretrained(
             self.model_name,
             torch_dtype=COMPUTE_TYPE_TO_TORCH_DTYPE.get(compute_type, torch.float32),
@@ -41,10 +44,7 @@ class WhisperModelHF(WhisperModel):
             use_flash_attention_2=self.asr_options["use_flash_attention"],
         )
         self.model.config.forced_decoder_ids = None
-        self.model.to(device).eval()
-
-        if self.asr_options["use_better_transformer"]:
-            self.model = self.model.to_bettertransformer()
+        self.model.to(device).eval()  # type: ignore
 
         self.generate_kwargs = {
             "max_new_tokens": max_text_token_len,
@@ -67,14 +67,21 @@ class WhisperModelHF(WhisperModel):
 
     def generate_segment_batched(
         self,
-        features,
-        prompts,
-        seq_lens,
-        seg_metadata,
+        features: torch.Tensor,
+        prompts: list[Any],
+        seq_lens: torch.Tensor,
+        seg_metadata: list[dict[str, Any]],
         **kwargs,
-    ):
+    ) -> list[dict]:
         if self.compute_type == "float16":
             features = features.to(self.device).half()
+
+        attention_mask = torch.ones(
+            features.shape[0], features.shape[1], device=features.device
+        )
+        for i, length in enumerate(seq_lens):
+            if length < features.shape[1]:
+                attention_mask[i, length:] = 0
 
         lang_and_task_pairs = {}
         for _i, _p in enumerate(prompts):
@@ -85,16 +92,23 @@ class WhisperModelHF(WhisperModel):
 
         response = [{} for _ in prompts]
         for (task, lang), idx_list in lang_and_task_pairs.items():
+            batch_generate_kwargs = self.generate_kwargs.copy()
+            batch_generate_kwargs["forced_decoder_ids"] = (
+                self.processor.get_decoder_prompt_ids(task=task, language=lang)
+            )
+
             predicted_ids = self.model.generate(
-                features[idx_list], task=task, language=lang, **self.generate_kwargs
+                features[idx_list],
+                attention_mask=attention_mask[idx_list],
+                **batch_generate_kwargs,
             )
 
             results = self.processor.batch_decode(
-                predicted_ids, skip_special_tokens=True
+                predicted_ids,
+                skip_special_tokens=True,
             )
 
             for idx, text in zip(idx_list, results):
                 response[idx]["text"] = text.strip()
 
         return response
-

@@ -1,20 +1,46 @@
 import os
+from typing import Any, Literal
 
 from platformdirs import user_cache_dir
-
-from .utils import write_outputs
 
 BASE_PATH = os.path.dirname(__file__)
 
 CACHE_DIR = user_cache_dir("whisper_s2t")
 os.makedirs(CACHE_DIR, exist_ok=True)
 
+Backend = Literal[
+    "CTranslate2",
+    "ct2",
+    "huggingface",
+    "hf",
+    "openai",
+    "oai",
+    "tensorrt",
+    "trt",
+    "trt-llm",
+    "tensorrt-llm",
+    "trt_llm",
+    "tensorrt_llm",
+]
 
-def load_model(model_identifier="large-v2", backend="CTranslate2", **model_kwargs):
+ModelIdentifier = Literal[
+    "large-v2",
+    "large-v3",
+    "distil-large-v2",
+]
 
-    if model_identifier in ["large-v3"]:
+
+def load_model(
+    model_identifier: ModelIdentifier = "large-v2",
+    backend: Backend = "CTranslate2",
+    **kwargs: dict[str, Any],
+):
+    model_kwargs = dict(**kwargs)
+    identifier = model_identifier.lower()
+
+    if identifier in ["large-v3"]:
         model_kwargs["n_mels"] = 128
-    elif (model_identifier in ["distil-large-v2"]) and (
+    elif (identifier in ["distil-large-v2"]) and (
         backend.lower() not in ["huggingface", "hf"]
     ):
         print(
@@ -31,10 +57,10 @@ def load_model(model_identifier="large-v2", backend="CTranslate2", **model_kwarg
     elif backend.lower() in ["huggingface", "hf"]:
         from .backends.huggingface.model import WhisperModelHF as WhisperModel
 
-        if "distil" in model_identifier:
-            model_identifier = f"distil-whisper/{model_identifier}"
+        if "distil" in identifier:
+            identifier = f"distil-whisper/{identifier}"
         else:
-            model_identifier = f"openai/whisper-{model_identifier}"
+            identifier = f"openai/whisper-{identifier}"
 
     elif backend.lower() in ["openai", "oai"]:
         from .backends.openai.model import WhisperModelOAI as WhisperModel
@@ -53,5 +79,4 @@ def load_model(model_identifier="large-v2", backend="CTranslate2", **model_kwarg
             f"Backend name '{backend}' is invalid. Only following options are available: ['CTranslate2', 'TensorRT-LLM', 'HuggingFace', 'OpenAI']"
         )
 
-    return WhisperModel(model_identifier, **model_kwargs)
-
+    return WhisperModel(identifier, **model_kwargs)

@@ -7,14 +7,13 @@ def parse_arguments():
     parser.add_argument('--repo_path', default="", type=str)
     parser.add_argument('--batch_size', default=16, type=int)
     parser.add_argument('--flash_attention', default="no", type=str)
-    parser.add_argument('--better_transformer', default="no", type=str)
     parser.add_argument('--eval_mp3', default="no", type=str)
     parser.add_argument('--eval_multilingual', default="yes", type=str)
     args = parser.parse_args()
     return args
 
 
-def run(repo_path, flash_attention=False, better_transformer=False, batch_size=16, eval_mp3=False, eval_multilingual=True):
+def run(repo_path, flash_attention=False, batch_size=16, eval_mp3=False, eval_multilingual=True):
     import torch
     import time, os
     import pandas as pd
@@ -38,10 +37,6 @@ def run(repo_path, flash_attention=False, better_transformer=False, batch_size=1
                    torch_dtype=torch.float16,
                    device="cuda",
                    model_kwargs=model_kwargs)
-    
-    if (not flash_attention) and better_transformer:
-        ASR.model = ASR.model.to_bettertransformer()
-        results_dir = f"{results_dir}-bt"
     
     os.makedirs(results_dir, exist_ok=True)
 
@@ -154,6 +149,5 @@ if __name__ == '__main__':
     eval_mp3 = True if args.eval_mp3 == "yes" else False
     eval_multilingual = True if args.eval_multilingual == "yes" else False
     flash_attention = True if args.flash_attention == "yes" else False
-    better_transformer = True if args.better_transformer == "yes" else False
 
-    run(args.repo_path, flash_attention=flash_attention, better_transformer=better_transformer, batch_size=args.batch_size, eval_mp3=eval_mp3, eval_multilingual=eval_multilingual)
+    run(args.repo_path, flash_attention=flash_attention, batch_size=args.batch_size, eval_mp3=eval_mp3, eval_multilingual=eval_multilingual)

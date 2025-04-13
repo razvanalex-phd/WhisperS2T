@@ -6,13 +6,12 @@ def parse_arguments():
     parser.add_argument('--backend', default="HuggingFace", type=str)
     parser.add_argument('--batch_size', default=16, type=int)
     parser.add_argument('--flash_attention', default="yes", type=str)
-    parser.add_argument('--better_transformer', default="no", type=str)
     parser.add_argument('--eval_mp3', default="no", type=str)
     parser.add_argument('--eval_multilingual', default="no", type=str)
     args = parser.parse_args()
     return args
 
-def run(repo_path, backend, flash_attention=False, better_transformer=False, batch_size=16, eval_mp3=False, eval_multilingual=True):
+def run(repo_path, backend, flash_attention=False, batch_size=16, eval_mp3=False, eval_multilingual=True):
     import sys, time, os
 
     if len(repo_path):
@@ -24,13 +23,10 @@ def run(repo_path, backend, flash_attention=False, better_transformer=False, bat
     if backend.lower() in ["huggingface", "hf"]:
         asr_options = {
             "use_flash_attention": flash_attention,
-            "use_better_transformer": better_transformer
         }
 
         if flash_attention:
             results_dir = f"{repo_path}/results/WhisperS2T-{backend}DistilWhisper-bs_{batch_size}-fa"
-        elif better_transformer:
-            results_dir = f"{repo_path}/results/WhisperS2T-{backend}DistilWhisper-bs_{batch_size}-bt"
         else:
             results_dir = f"{repo_path}/results/WhisperS2T-{backend}DistilWhisper-bs_{batch_size}"
     else:
@@ -124,6 +120,5 @@ if __name__ == '__main__':
     eval_mp3 = True if args.eval_mp3 == "yes" else False
     eval_multilingual = True if args.eval_multilingual == "yes" else False
     flash_attention = True if args.flash_attention == "yes" else False
-    better_transformer = True if args.better_transformer == "yes" else False
 
-    run(args.repo_path, args.backend, flash_attention=flash_attention, better_transformer=better_transformer, batch_size=args.batch_size, eval_mp3=eval_mp3, eval_multilingual=eval_multilingual)
+    run(args.repo_path, args.backend, flash_attention=flash_attention, batch_size=args.batch_size, eval_mp3=eval_mp3, eval_multilingual=eval_multilingual)
