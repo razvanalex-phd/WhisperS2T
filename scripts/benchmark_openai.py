@@ -16,7 +16,7 @@ def run(repo_path):
     results_dir = f"{repo_path}/results/OpenAI"
     os.makedirs(results_dir, exist_ok=True)
 
-    model = whisper.load_model('large-v2')
+    model = whisper.load_model('large-v3')
     model = model.cuda().eval()
 
     # KINCAID46 WAV >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>

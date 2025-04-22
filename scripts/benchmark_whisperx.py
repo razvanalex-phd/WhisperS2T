@@ -17,7 +17,7 @@ def run(repo_path, batch_size=16):
     results_dir = f"{repo_path}/results/WhisperX-bs_{batch_size}"
     os.makedirs(results_dir, exist_ok=True)
 
-    model = whisperx.load_model("large-v2", "cuda", compute_type="float16", language='en', asr_options={'beam_size': 1})
+    model = whisperx.load_model("large-v3", "cuda", compute_type="float16", language='en', asr_options={'beam_size': 1})
 
     # KINCAID46 WAV >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
     data = pd.read_csv(f'{repo_path}/data/KINCAID46/manifest_wav.tsv', sep="\t")

@@ -32,7 +32,7 @@ def run(repo_path, batch_size=16, eval_mp3=True, eval_multilingual=True):
         'trt_build_args': trt_build_args,
     }
 
-    model = whisper_s2t.load_model(model_identifier="large-v2", backend='TensorRT-LLM', **model_kwargs)
+    model = whisper_s2t.load_model(model_identifier="large-v3", backend='TensorRT-LLM', **model_kwargs)
 
     # KINCAID46 WAV >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
     data = pd.read_csv(f'{repo_path}/data/KINCAID46/manifest_wav.tsv', sep="\t")
