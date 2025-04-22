@@ -16,13 +16,18 @@
 # limitations under the License.
 
 import json
+import math
+import os
 from collections import OrderedDict
 from pathlib import Path
 from typing import Any
 
+loggers = ["TRACE", "DEBUG", "INFO", "WARNING", "ERROR"]
+os.environ["TLLM_LOG_LEVEL"] = loggers[4]  # Must be BEFORE importing tensorrt_llm
+
 import tensorrt_llm
 import torch
-from tensorrt_llm._utils import str_dtype_to_trt, trt_dtype_to_torch
+from tensorrt_llm._utils import str_dtype_to_torch, str_dtype_to_trt, trt_dtype_to_torch
 from tensorrt_llm.bindings import GptJsonConfig, KVCacheType
 from tensorrt_llm.runtime import PYTHON_BINDINGS, ModelConfig, SamplingConfig
 from tensorrt_llm.runtime.session import Session, TensorInfo
@@ -38,7 +43,10 @@ def remove_tensor_padding(
     input_tensor_lengths: torch.Tensor | None = None,
     pad_value: int = 0,
 ) -> torch.Tensor:
-    if input_tensor.dim() == 2:
+    if pad_value:
+        assert (
+            input_tensor_lengths is None
+        ), "input_tensor_lengths should be None when pad_value is provided"
         # Text tensor case: batch, seq_len
         assert torch.all(
             input_tensor[:, 0] != pad_value
@@ -51,25 +59,22 @@ def remove_tensor_padding(
         # Apply the mask to input_tensor to remove pad tokens
         output_tensor = input_tensor[mask].view(1, -1)
 
-    elif input_tensor.dim() == 3:
+    else:
         # Audio tensor case: batch, seq_len, feature_len
+        # position_ids case: batch, seq_len
         assert (
             input_tensor_lengths is not None
         ), "input_tensor_lengths must be provided for 3D input_tensor"
-        batch_size, _seq_len, _feature_len = input_tensor.shape
 
         # Initialize a list to collect valid sequences
         valid_sequences = []
 
-        for i in range(batch_size):
+        for i in range(input_tensor.shape[0]):
             valid_length = input_tensor_lengths[i]
-            valid_sequences.append(input_tensor[i, :valid_length, :])
+            valid_sequences.append(input_tensor[i, :valid_length])
 
         # Concatenate all valid sequences along the batch dimension
         output_tensor = torch.cat(valid_sequences, dim=0)
-
-    else:
-        raise ValueError("Input tensor must have 2 or 3 dimensions")
 
     return output_tensor
 
@@ -102,23 +107,49 @@ class WhisperEncoding:
 
     def get_audio_features(
         self,
-        mel: torch.Tensor,
+        mel: list[torch.Tensor] | torch.Tensor,
         mel_input_lengths: torch.Tensor,
         encoder_downsampling_factor: int = 2,
     ) -> tuple[torch.Tensor, torch.Tensor]:
+        if isinstance(mel, list):
+            longest_mel = max([f.shape[-1] for f in mel])
+            mel = [
+                torch.nn.functional.pad(
+                    f, (0, longest_mel - f.shape[-1]), mode="constant"
+                )
+                for f in mel
+            ]
+            mel = torch.cat(mel, dim=0).type(str_dtype_to_torch("float16")).contiguous()
+
+        bsz, seq_len = mel.shape[0], mel.shape[2]
+        position_ids = (
+            torch.arange(
+                math.ceil(seq_len / encoder_downsampling_factor),
+                dtype=torch.int32,
+                device=mel.device,
+            )
+            .expand(bsz, -1)
+            .contiguous()
+        )
         if self.encoder_config["plugin_config"]["remove_input_padding"]:
             # mel B,D,T -> B,T,D -> BxT, D
             mel = mel.transpose(1, 2)
             mel = remove_tensor_padding(mel, mel_input_lengths)
-
+            position_ids = remove_tensor_padding(
+                position_ids, mel_input_lengths // encoder_downsampling_factor
+            )
         inputs = OrderedDict()
         inputs["input_features"] = mel
         inputs["input_lengths"] = mel_input_lengths
+        inputs["position_ids"] = position_ids
 
         output_list = [
             TensorInfo("input_features", str_dtype_to_trt(self.dtype), mel.shape),
             TensorInfo(
                 "input_lengths", str_dtype_to_trt("int32"), mel_input_lengths.shape
+            ),
+            TensorInfo(
+                "position_ids", str_dtype_to_trt("int32"), inputs["position_ids"].shape
             ),
         ]
 
@@ -205,8 +236,6 @@ class WhisperDecoding:
         eot_id: int,
         max_new_tokens: int = 40,
         num_beams: int = 1,
-        stop_words_list: list[list[int]] | None = None,
-        bad_words_list: list[list[int]] | None = None,
         temperature: float = 1,
         length_penalty: float = 1,
         repetition_penalty: float = 1,
@@ -217,10 +246,18 @@ class WhisperDecoding:
             dtype=torch.int32,
             device="cuda",
         )
-        decoder_max_input_length = torch.max(decoder_input_lengths).item()
+        decoder_max_input_length: int = torch.max(decoder_input_lengths).item()  # type: ignore
 
         cross_attention_mask = (
-            torch.ones([batch_size, 1, encoder_max_input_length]).int().cuda()
+            torch.ones(
+                [
+                    batch_size,
+                    decoder_max_input_length + max_new_tokens,
+                    encoder_max_input_length,
+                ]
+            )
+            .int()
+            .cuda()
         )
 
         # generation config
@@ -228,8 +265,6 @@ class WhisperDecoding:
             end_id=eot_id,
             pad_id=eot_id,
             num_beams=num_beams,
-            stop_words_list=stop_words_list,
-            bad_words_list=bad_words_list,
             temperature=temperature,
             length_penalty=length_penalty,
             repetition_penalty=repetition_penalty,
@@ -262,6 +297,7 @@ class WhisperDecoding:
                 encoder_outputs = remove_tensor_padding(
                     encoder_outputs, encoder_output_lens
                 )
+
         output_ids = self.decoder_generation_session.decode(
             decoder_input_ids,
             decoder_input_lengths,
@@ -306,16 +342,17 @@ class WhisperTRT:
                 engine_dir / "decoder" / "config.json"
             )
             assert json_config.model_config.supports_inflight_batching
-            trt_build_args = load_trt_build_config(engine_dir)
+            trt_build_args = load_trt_build_config(engine_dir)  # type: ignore
             runner_kwargs = dict(
                 engine_dir=engine_dir,
                 is_enc_dec=True,
-                kv_cache_free_gpu_memory_fraction=0.9,
                 max_batch_size=trt_build_args.max_batch_size,
                 max_input_len=trt_build_args.max_input_len_enc,
                 max_output_len=trt_build_args.max_output_len,
                 max_beam_width=trt_build_args.max_beam_width,
                 debug_mode=trt_build_args.debug_mode,
+                kv_cache_free_gpu_memory_fraction=0.9,
+                cross_kv_cache_fraction=0.5,
             )
             self.model_runner_cpp = ModelRunnerCpp.from_dir(**runner_kwargs)  # type: ignore
         self.use_py_session = use_py_session
@@ -324,13 +361,11 @@ class WhisperTRT:
         self,
         mel: torch.Tensor,
         mel_input_lengths: torch.Tensor,
-        prompt: list[torch.Tensor],
+        prompt: torch.Tensor,
         num_beams: int = 1,
         max_new_tokens: int = 96,
         end_id: int = 0,
         pad_id: int = 0,
-        stop_words_list: list[list[int]] | None = None,
-        bad_words_list: list[list[int]] | None = None,
         temperature: float = 1,
         length_penalty: float = 1,
         repetition_penalty: float = 1,
@@ -339,7 +374,7 @@ class WhisperTRT:
             encoder_output, encoder_output_lengths = self.encoder.get_audio_features(
                 mel, mel_input_lengths
             )
-            encoder_max_input_length = torch.max(encoder_output_lengths).item()
+            encoder_max_input_length: int = torch.max(encoder_output_lengths).item()  # type: ignore
             output_ids = self.decoder.generate(
                 prompt,
                 encoder_output,
@@ -348,11 +383,6 @@ class WhisperTRT:
                 end_id,
                 max_new_tokens=max_new_tokens,
                 num_beams=num_beams,
-                bad_words_list=bad_words_list,
-                stop_words_list=stop_words_list,
-                temperature=temperature,
-                length_penalty=length_penalty,
-                repetition_penalty=repetition_penalty,
             )
         else:
             with torch.no_grad():
@@ -366,8 +396,6 @@ class WhisperTRT:
                     num_beams=num_beams,
                     output_sequence_lengths=True,
                     return_dict=True,
-                    bad_words_list=bad_words_list,
-                    stop_words_list=stop_words_list,
                     temperature=temperature,
                     length_penalty=length_penalty,
                     repetition_penalty=repetition_penalty,
@@ -403,11 +431,11 @@ class WhisperTRT:
             dtype=torch.int32,
             device=features.device,
         )
-        prompts = list(map(lambda x: torch.tensor(x, dtype=torch.int32), prompts))
+        prompts_ = torch.tensor(prompts, dtype=torch.int32)
         output_ids = self.process_batch(
             features,
             features_lengths,
-            prompts,
+            prompts_,
             **generate_kwargs,
         )
         return output_ids

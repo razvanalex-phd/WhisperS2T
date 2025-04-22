@@ -1,6 +1,7 @@
 import hashlib
 import json
 import os
+import subprocess
 from typing import Any
 
 import pynvml
@@ -27,10 +28,10 @@ class TRTBuilderConfig:
         dtype: str = "float16",
         quantize_dir: str = "quantize/1-gpu",
         use_gpt_attention_plugin: str | None = "float16",
-        use_bert_attention_plugin: str | None = None,
+        use_bert_attention_plugin: str | None = "float16",
         use_context_fmha_enc: bool = False,
         use_context_fmha_dec: bool = False,
-        use_gemm_plugin: str | None = "float16",
+        use_gemm_plugin: str | None = None,
         remove_input_padding: bool = True,
         use_weight_only: bool = True,
         weight_only_precision: str = "int8",
@@ -104,7 +105,7 @@ def load_trt_build_config(output_dir: str) -> TRTBuilderConfig:
 
 
 def build_trt_engine(
-    model_name: str = "large-v2",
+    model_name: str = "large-v3",
     args: TRTBuilderConfig | None = None,
     force: bool = False,
     _log_level: str = "error",
@@ -164,13 +165,34 @@ def build_trt_engine(
         console=console,
     ):
         cmd = f"python3 -m whisper_s2t.backends.tensorrt.engine_builder.builder --output_dir='{args.output_dir}'"
-        out_logs = os.popen(cmd).read().split("\n")
+        process = subprocess.Popen(
+            cmd,
+            shell=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            universal_newlines=True,
+        )
+
+        assert process.stdout is not None
         print_flag = False
-        for line in out_logs:
+        output_lines = []
+
+        # Process output in real-time
+        for line in process.stdout:
+            output_lines.append(line.rstrip())
             if print_flag:
-                console.print(line)
+                console.print(line.rstrip())
             elif "TRTBuilderConfig" in line:
                 print_flag = True
                 console.print("[TRTBuilderConfig]:")
+
+        # Wait for process to complete and get return code
+        return_code = process.wait()
+
+        if return_code != 0:
+            error_output = "\n".join(output_lines)
+            raise RuntimeError(
+                f"Engine build failed with return code {return_code}.\nOutput: {error_output}"
+            )
 
     return args.output_dir

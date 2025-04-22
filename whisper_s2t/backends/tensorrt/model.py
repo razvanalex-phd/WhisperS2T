@@ -123,7 +123,8 @@ class WhisperModelTRT(WhisperModel):
         # Load tokenizer
         tokenizer_file = os.path.join(self.model_path, "tokenizer.json")
         tokenizer = Tokenizer(
-            tokenizers.Tokenizer.from_file(tokenizer_file), self.model.is_multilingual
+            tokenizers.Tokenizer.from_file(tokenizer_file),
+            self.model.is_multilingual,
         )
 
         if self.asr_options["word_timestamps"]:
@@ -147,8 +148,6 @@ class WhisperModelTRT(WhisperModel):
             "length_penalty": self.asr_options["length_penalty"],
             "repetition_penalty": self.asr_options["repetition_penalty"],
             "num_beams": self.asr_options["beam_size"],
-            "stop_words_list": [1 if self.asr_options["suppress_blank"] else 0],
-            "bad_words_list": self.asr_options["suppress_tokens"],
             "temperature": self.asr_options["sampling_temperature"],
         }
 
@@ -206,16 +205,16 @@ class WhisperModelTRT(WhisperModel):
         return [
             dict(
                 word=word,
-                start=int(round(start, 2)),
-                end=int(round(end, 2)),
-                prob=int(round(prob, 2)),
+                start=float(round(start, 2)),
+                end=float(round(end, 2)),
+                prob=float(round(prob, 2)),
             )
             for word, start, end, prob in zip(words, start_times, end_times, word_probs)
         ]
 
     def align_words(
         self,
-        features: torch.Tensor,
+        features: np.ndarray | torch.Tensor,
         texts: list[str],
         text_tokens: list[list[int]],
         sot_seqs: list[tuple[int, ...]],
@@ -310,11 +309,11 @@ class WhisperModelTRT(WhisperModel):
             ]
             sot_seqs = [tuple(_[-4:]) for _ in prompts]
             word_timings = self.align_words(
-                align_features,
+                features,
                 texts,
                 text_tokens,
                 sot_seqs,
-                align_seq_lens,
+                seq_lens,
                 seg_metadata,
             )
 
