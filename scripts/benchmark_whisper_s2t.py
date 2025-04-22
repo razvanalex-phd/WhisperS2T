@@ -35,7 +35,7 @@ def run(repo_path, backend, flash_attention=False, batch_size=16, eval_mp3=False
 
     os.makedirs(results_dir, exist_ok=True)
 
-    model = whisper_s2t.load_model("large-v2", backend=backend, asr_options=asr_options)
+    model = whisper_s2t.load_model("large-v3", backend=backend, asr_options=asr_options)
 
     # KINCAID46 WAV >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
     data = pd.read_csv(f'{repo_path}/data/KINCAID46/manifest_wav.tsv', sep="\t")

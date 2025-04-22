@@ -31,9 +31,9 @@ ModelIdentifier = Literal[
 
 
 def load_model(
-    model_identifier: ModelIdentifier = "large-v2",
+    model_identifier: ModelIdentifier = "large-v3",
     backend: Backend = "CTranslate2",
-    **kwargs: dict[str, Any],
+    **kwargs: Any,
 ):
     model_kwargs = dict(**kwargs)
     identifier = model_identifier.lower()

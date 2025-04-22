@@ -32,7 +32,7 @@ def run(repo_path, flash_attention=False, batch_size=16, eval_mp3=False, eval_mu
         model_kwargs["use_flash_attention_2"] = True
 
     ASR = pipeline("automatic-speech-recognition",
-                   "openai/whisper-large-v2",
+                   "openai/whisper-large-v3",
                    num_workers=1,
                    torch_dtype=torch.float16,
                    device="cuda",
