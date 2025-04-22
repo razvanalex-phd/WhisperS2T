@@ -1,4 +1,4 @@
-# Modified from: https://github.com/NVIDIA/TensorRT-LLM/blob/5fa9436e17c2f9aeace070f49aa645d2577f676b/examples/whisper/convert_checkpoint.py
+# Modified from: https://github.com/NVIDIA/TensorRT-LLM/blob/d51ae53940e2a259375069c57fca7656dc9c5af2/examples/models/core/whisper/convert_checkpoint.py
 
 # SPDX-FileCopyrightText: Copyright (c) 2022-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
@@ -17,12 +17,15 @@
 
 import argparse
 import json
+import logging
 import os
+import sys
 import time
 from argparse import Namespace
 
 import torch
 from safetensors.torch import save_file
+
 from tensorrt_llm.functional import LayerNormPositionType, LayerNormType
 from tensorrt_llm.models.convert_utils import weight_only_quantize_dict
 from tensorrt_llm.quantization import QuantAlgo
@@ -32,6 +35,13 @@ from whisper_s2t.backends.tensorrt.engine_builder import (
     load_trt_build_config,
 )
 from whisper_s2t.backends.tensorrt.engine_builder.model_utils import sinusoids
+
+# Set up logger
+logger = logging.getLogger(__name__)
+logging.basicConfig(
+    level=logging.INFO,
+    format="[%(asctime)s][%(name)s][%(levelname)s]: %(message)s",
+)
 
 
 def parse_arguments() -> Namespace:
@@ -43,6 +53,7 @@ def parse_arguments() -> Namespace:
         type=str,
         default="large-v2",
         choices=[
+            "large-v3-turbo",
             "large-v3",
             "large-v2",
             "medium",
@@ -105,8 +116,9 @@ def get_encoder_config(model_metadata: dict, dtype: str, quant_algo: QuantAlgo) 
         "num_hidden_layers": model_metadata["n_audio_layer"],
         "num_attention_heads": model_metadata["n_audio_head"],
         "hidden_size": model_metadata["n_audio_state"],
+        "max_position_embeddings": model_metadata["n_audio_ctx"],
+        "has_position_embedding": True,
         "n_mels": model_metadata["n_mels"],
-        "n_audio_ctx": model_metadata["n_audio_ctx"],
         "vocab_size": model_metadata["n_vocab"],
         "hidden_act": "gelu",
         "num_languages": num_languages,
@@ -120,6 +132,11 @@ def get_decoder_config(
     logits_dtype: str,
     quant_algo: QuantAlgo,
 ) -> dict:
+    # Ensure max_position_embeddings has a valid value
+    max_pos_embeddings = model_metadata.get("n_text_ctx", 448)
+    if max_pos_embeddings is None:
+        max_pos_embeddings = 448  # Default value if not specified
+
     return {
         "architecture": "DecoderModel",
         "dtype": dtype,
@@ -132,7 +149,7 @@ def get_decoder_config(
         "hidden_act": "gelu",
         "use_parallel_embedding": False,
         "embedding_sharding_dim": 0,
-        "max_position_embeddings": model_metadata["n_text_ctx"],
+        "max_position_embeddings": max_pos_embeddings,
         "use_prompt_tuning": False,
         "head_size": model_metadata["n_text_state"] // model_metadata["n_text_head"],
         "has_position_embedding": True,
@@ -165,7 +182,7 @@ def convert_openai_whisper_encoder(
 ) -> dict[str, torch.Tensor]:
     weights = {}
 
-    weights["positional_embedding"] = sinusoids(
+    weights["position_embedding.weight"] = sinusoids(
         model_metadata["n_audio_ctx"], model_metadata["n_audio_state"]
     ).contiguous()
 
@@ -187,10 +204,12 @@ def convert_openai_whisper_encoder(
         weights["conv2.bias"] = weights["conv2.bias"].float()
 
     for i in range(model_metadata["n_audio_layer"]):
-        weights[f"encoder_layers.{i}.attention_layernorm.weight"] = model_params[
-            "encoder.blocks." + str(i) + ".attn_ln.weight"
-        ].contiguous()
-        weights[f"encoder_layers.{i}.attention_layernorm.bias"] = model_params[
+        trtllm_layer_name_prefix = f"encoder_layers.{i}"
+
+        weights[f"{trtllm_layer_name_prefix}.attention_layernorm.weight"] = (
+            model_params["encoder.blocks." + str(i) + ".attn_ln.weight"].contiguous()
+        )
+        weights[f"{trtllm_layer_name_prefix}.attention_layernorm.bias"] = model_params[
             "encoder.blocks." + str(i) + ".attn_ln.bias"
         ].contiguous()
 
@@ -203,7 +222,7 @@ def convert_openai_whisper_encoder(
             dim=0,
         ).contiguous()
 
-        weights[f"encoder_layers.{i}.attention.qkv.weight"] = t
+        weights[f"{trtllm_layer_name_prefix}.attention.qkv.weight"] = t
 
         bias_shape = model_params["encoder.blocks." + str(i) + ".attn.query.bias"].shape
         dtype = model_params["encoder.blocks." + str(i) + ".attn.query.bias"].dtype
@@ -216,33 +235,33 @@ def convert_openai_whisper_encoder(
             dim=0,
         ).contiguous()
 
-        weights[f"encoder_layers.{i}.attention.qkv.bias"] = fused_bias
+        weights[f"{trtllm_layer_name_prefix}.attention.qkv.bias"] = fused_bias
 
         t = model_params["encoder.blocks." + str(i) + ".attn.out.weight"].contiguous()
 
-        weights[f"encoder_layers.{i}.attention.dense.weight"] = t
-        weights[f"encoder_layers.{i}.attention.dense.bias"] = model_params[
+        weights[f"{trtllm_layer_name_prefix}.attention.dense.weight"] = t
+        weights[f"{trtllm_layer_name_prefix}.attention.dense.bias"] = model_params[
             "encoder.blocks." + str(i) + ".attn.out.bias"
         ].contiguous()
 
-        weights[f"encoder_layers.{i}.mlp_layernorm.weight"] = model_params[
+        weights[f"{trtllm_layer_name_prefix}.mlp_layernorm.weight"] = model_params[
             "encoder.blocks." + str(i) + ".mlp_ln.weight"
         ].contiguous()
-        weights[f"encoder_layers.{i}.mlp_layernorm.bias"] = model_params[
+        weights[f"{trtllm_layer_name_prefix}.mlp_layernorm.bias"] = model_params[
             "encoder.blocks." + str(i) + ".mlp_ln.bias"
         ].contiguous()
 
         t = model_params["encoder.blocks." + str(i) + ".mlp.0.weight"].contiguous()
-        weights[f"encoder_layers.{i}.mlp.fc.weight"] = t
+        weights[f"{trtllm_layer_name_prefix}.mlp.fc.weight"] = t
 
-        weights[f"encoder_layers.{i}.mlp.fc.bias"] = model_params[
+        weights[f"{trtllm_layer_name_prefix}.mlp.fc.bias"] = model_params[
             "encoder.blocks." + str(i) + ".mlp.0.bias"
         ].contiguous()
 
         t = model_params["encoder.blocks." + str(i) + ".mlp.2.weight"].contiguous()
-        weights[f"encoder_layers.{i}.mlp.proj.weight"] = t
+        weights[f"{trtllm_layer_name_prefix}.mlp.proj.weight"] = t
 
-        weights[f"encoder_layers.{i}.mlp.proj.bias"] = model_params[
+        weights[f"{trtllm_layer_name_prefix}.mlp.proj.bias"] = model_params[
             "encoder.blocks." + str(i) + ".mlp.2.bias"
         ].contiguous()
 
@@ -262,12 +281,14 @@ def convert_openai_whisper_decoder(
     weights["embedding.vocab_embedding.weight"] = model_params[
         "decoder.token_embedding.weight"
     ]
-    weights["lm_head.weight"] = model_params["decoder.token_embedding.weight"].clone()
     weights["embedding.position_embedding.weight"] = model_params[
         "decoder.positional_embedding"
     ]
+    weights["lm_head.weight"] = model_params["decoder.token_embedding.weight"].clone()
 
     for i in range(model_metadata["n_text_layer"]):
+        trtllm_layer_name_prefix = f"decoder_layers.{i}"
+
         t = torch.cat(
             [
                 model_params["decoder.blocks." + str(i) + ".attn.query.weight"],
@@ -276,14 +297,14 @@ def convert_openai_whisper_decoder(
             ],
             dim=0,
         )
-        weights[f"decoder_layers.{i}.self_attention.qkv.weight"] = t
+        weights[f"{trtllm_layer_name_prefix}.self_attention.qkv.weight"] = t
 
         t = model_params["decoder.blocks." + str(i) + ".attn.out.weight"].contiguous()
-        weights[f"decoder_layers.{i}.self_attention.dense.weight"] = t
+        weights[f"{trtllm_layer_name_prefix}.self_attention.dense.weight"] = t
 
         bias_shape = model_params["decoder.blocks." + str(i) + ".attn.query.bias"].shape
         dtype = model_params["decoder.blocks." + str(i) + ".attn.query.bias"].dtype
-        weights[f"decoder_layers.{i}.self_attention.qkv.bias"] = torch.cat(
+        weights[f"{trtllm_layer_name_prefix}.self_attention.qkv.bias"] = torch.cat(
             [
                 model_params["decoder.blocks." + str(i) + ".attn.query.bias"],
                 torch.zeros([*bias_shape], dtype=dtype),
@@ -291,16 +312,16 @@ def convert_openai_whisper_decoder(
             ],
             dim=0,
         )
-        weights[f"decoder_layers.{i}.self_attention.dense.bias"] = model_params[
+        weights[f"{trtllm_layer_name_prefix}.self_attention.dense.bias"] = model_params[
             "decoder.blocks." + str(i) + ".attn.out.bias"
         ]
 
-        weights[f"decoder_layers.{i}.self_attention_layernorm.weight"] = model_params[
-            "decoder.blocks." + str(i) + ".attn_ln.weight"
-        ]
-        weights[f"decoder_layers.{i}.self_attention_layernorm.bias"] = model_params[
-            "decoder.blocks." + str(i) + ".attn_ln.bias"
-        ]
+        weights[f"{trtllm_layer_name_prefix}.self_attention_layernorm.weight"] = (
+            model_params["decoder.blocks." + str(i) + ".attn_ln.weight"]
+        )
+        weights[f"{trtllm_layer_name_prefix}.self_attention_layernorm.bias"] = (
+            model_params["decoder.blocks." + str(i) + ".attn_ln.bias"]
+        )
 
         t = torch.cat(
             [
@@ -310,12 +331,12 @@ def convert_openai_whisper_decoder(
             ],
             dim=0,
         )
-        weights[f"decoder_layers.{i}.cross_attention.qkv.weight"] = t
+        weights[f"{trtllm_layer_name_prefix}.cross_attention.qkv.weight"] = t
 
         t = model_params[
             "decoder.blocks." + str(i) + ".cross_attn.out.weight"
         ].contiguous()
-        weights[f"decoder_layers.{i}.cross_attention.dense.weight"] = t
+        weights[f"{trtllm_layer_name_prefix}.cross_attention.dense.weight"] = t
 
         bias_shape = model_params[
             "decoder.blocks." + str(i) + ".cross_attn.query.bias"
@@ -332,36 +353,38 @@ def convert_openai_whisper_decoder(
             dim=0,
         )
 
-        weights[f"decoder_layers.{i}.cross_attention.qkv.bias"] = cross_attn_qkv_bias
+        weights[f"{trtllm_layer_name_prefix}.cross_attention.qkv.bias"] = (
+            cross_attn_qkv_bias
+        )
 
-        weights[f"decoder_layers.{i}.cross_attention.dense.bias"] = model_params[
-            "decoder.blocks." + str(i) + ".cross_attn.out.bias"
-        ]
+        weights[f"{trtllm_layer_name_prefix}.cross_attention.dense.bias"] = (
+            model_params["decoder.blocks." + str(i) + ".cross_attn.out.bias"]
+        )
 
-        weights[f"decoder_layers.{i}.cross_attention_layernorm.weight"] = model_params[
-            "decoder.blocks." + str(i) + ".cross_attn_ln.weight"
-        ]
-        weights[f"decoder_layers.{i}.cross_attention_layernorm.bias"] = model_params[
-            "decoder.blocks." + str(i) + ".cross_attn_ln.bias"
-        ]
+        weights[f"{trtllm_layer_name_prefix}.cross_attention_layernorm.weight"] = (
+            model_params["decoder.blocks." + str(i) + ".cross_attn_ln.weight"]
+        )
+        weights[f"{trtllm_layer_name_prefix}.cross_attention_layernorm.bias"] = (
+            model_params["decoder.blocks." + str(i) + ".cross_attn_ln.bias"]
+        )
 
         t = model_params["decoder.blocks." + str(i) + ".mlp.0.weight"].contiguous()
-        weights[f"decoder_layers.{i}.mlp.fc.weight"] = t
+        weights[f"{trtllm_layer_name_prefix}.mlp.fc.weight"] = t
 
         t = model_params["decoder.blocks." + str(i) + ".mlp.2.weight"].contiguous()
-        weights[f"decoder_layers.{i}.mlp.proj.weight"] = t
+        weights[f"{trtllm_layer_name_prefix}.mlp.proj.weight"] = t
 
-        weights[f"decoder_layers.{i}.mlp.fc.bias"] = model_params[
+        weights[f"{trtllm_layer_name_prefix}.mlp.fc.bias"] = model_params[
             "decoder.blocks." + str(i) + ".mlp.0.bias"
         ]
-        weights[f"decoder_layers.{i}.mlp.proj.bias"] = model_params[
+        weights[f"{trtllm_layer_name_prefix}.mlp.proj.bias"] = model_params[
             "decoder.blocks." + str(i) + ".mlp.2.bias"
         ]
 
-        weights[f"decoder_layers.{i}.mlp_layernorm.weight"] = model_params[
+        weights[f"{trtllm_layer_name_prefix}.mlp_layernorm.weight"] = model_params[
             "decoder.blocks." + str(i) + ".mlp_ln.weight"
         ]
-        weights[f"decoder_layers.{i}.mlp_layernorm.bias"] = model_params[
+        weights[f"{trtllm_layer_name_prefix}.mlp_layernorm.bias"] = model_params[
             "decoder.blocks." + str(i) + ".mlp_ln.bias"
         ]
 
@@ -382,20 +405,25 @@ def convert_checkpoints(args: TRTBuilderConfig) -> None:
         os.makedirs(args.checkpoint_dir)
 
     quant_algo = None
+    plugin_weight_only_quant_type = None
     if args.use_weight_only and args.weight_only_precision == "int8":
+        plugin_weight_only_quant_type = torch.int8
         quant_algo = QuantAlgo.W8A16
     elif args.use_weight_only and args.weight_only_precision == "int4":
+        plugin_weight_only_quant_type = torch.quint4x2
         quant_algo = QuantAlgo.W4A16
     elif args.use_weight_only and args.weight_only_precision == "int4_gptq":
         quant_algo = QuantAlgo.W4A16_GPTQ
 
-    model_dir = os.path.join(args.model_dir, args.model_name + ".pt")
-    assert os.path.exists(model_dir), f"Model {model_dir} does not exist."
+    model_path = os.path.join(args.model_dir, args.model_name + ".pt")
+    assert os.path.exists(model_path), f"Model {model_path} does not exist."
 
-    model = torch.load(model_dir, map_location="cpu")
-    print(f"Loaded model from {model_dir}")
+    model = torch.load(model_path, map_location="cpu")
+    logger.info(f"Loaded model from {model_path}")
     model_metadata = model["dims"]
     model_state_dict = model["model_state_dict"]
+    for param_tensor in model_state_dict:
+        model_state_dict[param_tensor] = model_state_dict[param_tensor].half()
 
     def convert_and_save(component: str = "encoder"):
         # call get_encoder_config or get_decoder_config according to component
@@ -436,14 +464,14 @@ def convert_checkpoints(args: TRTBuilderConfig) -> None:
 
         save_file(weights, os.path.join(component_save_dir, f"rank0.safetensors"))
 
-    print("Converting encoder checkpoints...")
+    logger.info("Converting encoder checkpoints...")
     convert_and_save("encoder")
-    print("Converting decoder checkpoints...")
+    logger.info("Converting decoder checkpoints...")
     convert_and_save("decoder")
 
     tok = time.time()
     t = time.strftime("%H:%M:%S", time.gmtime(tok - tik))
-    print(f"Total time of converting checkpoints: {t}")
+    logger.info(f"Total time of converting checkpoints: {t}")
 
 
 def run_build(args: TRTBuilderConfig) -> None:
@@ -456,13 +484,11 @@ def run_build(args: TRTBuilderConfig) -> None:
         --checkpoint_dir {args.checkpoint_dir}/encoder \
         --output_dir {args.output_dir}/encoder \
         --moe_plugin disable \
-        --enable_xqa disable \
         --max_batch_size {args.max_batch_size} \
         --max_input_len {args.max_input_len_enc} \
-        --max_seq_len {args.max_input_len_enc} "
+        --max_seq_len {args.max_input_len_enc} \
+        --gemm_plugin disable "
 
-    if args.use_gemm_plugin:
-        encoder_build_cmd += f"--gemm_plugin {args.use_gemm_plugin} "
     if args.use_bert_attention_plugin:
         encoder_build_cmd += (
             f"--bert_attention_plugin {args.use_bert_attention_plugin} "
@@ -471,16 +497,30 @@ def run_build(args: TRTBuilderConfig) -> None:
         encoder_build_cmd += "--use_fp8_context_fmha enable "
     if not args.remove_input_padding:
         encoder_build_cmd += "--remove_input_padding disable "
+    else:
+        encoder_build_cmd += "--remove_input_padding enable "
 
-    out_logs = os.popen(encoder_build_cmd).read().split("\n")
-    # for line in out_logs:
-    #     print(line)
+    if args.int8_kv_cache:
+        encoder_build_cmd += "--int8_kv_cache enable "
+
+    logger.info("Running encoder build command...")
+    logger.debug(encoder_build_cmd)
+
+    process = os.popen(encoder_build_cmd)
+    out_logs = process.read().split("\n")
+    return_code = process.close()
+    if return_code is not None:
+        # Non-zero return code indicates an error
+        logger.error(f"Error running encoder build command. Exit code: {return_code}")
+        for line in out_logs:
+            logger.error(line)
+        sys.exit(1)
+    logger.info("Encoder build completed successfully.")
 
     decoder_build_cmd = f"trtllm-build  \
         --checkpoint_dir {args.checkpoint_dir}/decoder \
         --output_dir {args.output_dir}/decoder \
         --moe_plugin disable \
-        --enable_xqa disable \
         --max_beam_width {args.max_beam_width} \
         --max_batch_size {args.max_batch_size} \
         --max_seq_len {args.max_output_len} \
@@ -494,15 +534,32 @@ def run_build(args: TRTBuilderConfig) -> None:
             f"--bert_attention_plugin {args.use_bert_attention_plugin} "
         )
     if args.use_gpt_attention_plugin:
-        decoder_build_cmd += f"--bert_attention_plugin {args.use_gpt_attention_plugin} "
+        decoder_build_cmd += f"--gpt_attention_plugin {args.use_gpt_attention_plugin} "
     if args.use_context_fmha_dec:
         decoder_build_cmd += "--use_fp8_context_fmha enable "
     if not args.remove_input_padding:
         decoder_build_cmd += "--remove_input_padding disable "
+    else:
+        decoder_build_cmd += "--remove_input_padding enable "
 
-    out_logs = os.popen(decoder_build_cmd).read().split("\n")
-    # for line in out_logs:
-    #     print(line)
+    if args.int8_kv_cache:
+        decoder_build_cmd += "--int8_kv_cache enable "
+
+    if args.remove_input_padding:  # If using C++ runtime configuration
+        decoder_build_cmd += "--paged_kv_cache enable "
+
+    logger.info("Running decoder build command...")
+    logger.debug(decoder_build_cmd)
+    process = os.popen(decoder_build_cmd)
+    out_logs = process.read().split("\n")
+    return_code = process.close()
+    if return_code is not None:
+        # Non-zero return code indicates an error
+        logger.error(f"Error running decoder build command. Exit code: {return_code}")
+        for line in out_logs:
+            logger.error(line)
+        sys.exit(1)
+    logger.info("Decoder build completed successfully.")
 
 
 def run(args: TRTBuilderConfig) -> None:
@@ -515,7 +572,7 @@ if __name__ == "__main__":
 
     trt_build_args = load_trt_build_config(args.output_dir)
 
-    print(f"[TRTBuilderConfig]:")
-    print(vars(trt_build_args))
+    logger.info("[TRTBuilderConfig]:")
+    logger.info(json.dumps(vars(trt_build_args), indent=4, default=str))
 
     run(args=trt_build_args)
