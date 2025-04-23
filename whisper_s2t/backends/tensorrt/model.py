@@ -282,9 +282,6 @@ class WhisperModelTRT(WhisperModel):
         prompts: list[list[int]],
         seq_lens: torch.Tensor,
         seg_metadata: list[dict[str, Any]],
-        *,
-        align_features: torch.Tensor,
-        align_seq_lens: torch.Tensor,
         **kwargs: Any,
     ) -> list[dict[str, Any]]:
         if self.compute_type == "float16":
