@@ -11,3 +11,4 @@ optimum==1.24.0
 transformers==4.48.3
 openai-whisper==20240930
 nvidia-ml-py==12.570.86
+kaldialign==0.9.1
