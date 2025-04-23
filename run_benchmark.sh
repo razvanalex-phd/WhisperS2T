@@ -3,7 +3,7 @@
 # Variable
 REPO_DIR=$(pwd)
 
-BATCH_SIZE=16
+BATCH_SIZE=32
 
 # Commons For All GPUs
 
