@@ -73,6 +73,7 @@ class WhisperModelTRT(WhisperModel):
         device_index: int = 0,
         compute_type: str = "float16",
         max_text_token_len: int = MAX_TEXT_TOKEN_LENGTH,
+        force_trt_build: bool = False,
         asr_options: dict[str, Any] = {},
         **model_kwargs: Any,
     ) -> None:
@@ -96,7 +97,9 @@ class WhisperModelTRT(WhisperModel):
                 )
 
             self.model_path = build_trt_engine(
-                model_name=model_name_or_path, args=trt_build_args
+                model_name=model_name_or_path,
+                args=trt_build_args,
+                force=force_trt_build,
             )
 
         if "trt_build_args" in model_kwargs:
