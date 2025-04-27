@@ -126,6 +126,9 @@ class WhisperModelTRT(WhisperModel):
             runtime_args=model_kwargs.get("runtime_args", None),
         )
 
+        if "runtime_args" in model_kwargs:
+            del model_kwargs["runtime_args"]
+
         # Load tokenizer
         tokenizer_file = os.path.join(self.model_path, "tokenizer.json")
         tokenizer = Tokenizer(
