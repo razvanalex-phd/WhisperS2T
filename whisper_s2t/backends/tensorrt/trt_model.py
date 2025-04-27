@@ -321,7 +321,8 @@ class WhisperTRT:
         debug_mode: bool = False,
         assets_dir: str | Path | None = None,
         use_py_session: bool = False,
-    ):
+        runtime_args: dict[str, Any] | None = None,
+    ) -> None:
         world_size = 1
         runtime_rank = tensorrt_llm.mpi_rank()
         runtime_mapping = tensorrt_llm.Mapping(world_size, runtime_rank)
@@ -354,6 +355,7 @@ class WhisperTRT:
                 kv_cache_free_gpu_memory_fraction=0.9,
                 cross_kv_cache_fraction=0.5,
             )
+            runner_kwargs.update(runtime_args or {})
             self.model_runner_cpp = ModelRunnerCpp.from_dir(**runner_kwargs)  # type: ignore
         self.use_py_session = use_py_session
 

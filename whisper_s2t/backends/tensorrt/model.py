@@ -121,7 +121,10 @@ class WhisperModelTRT(WhisperModel):
             self.asr_options["beam_size"] = self.trt_build_args.max_beam_width
 
         # Load model
-        self.model = WhisperTRT(self.model_path)
+        self.model = WhisperTRT(
+            self.model_path,
+            runtime_args=model_kwargs.get("runtime_args", None),
+        )
 
         # Load tokenizer
         tokenizer_file = os.path.join(self.model_path, "tokenizer.json")
