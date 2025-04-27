@@ -51,6 +51,7 @@ class WhisperModel(ABC):
         tokenizer: Any | None = None,
         vad_model: Any | None = None,
         n_mels: int = 80,
+        align_n_mels: int = 80,
         device: str = "cuda",
         device_index: int = 0,
         compute_type: str = "float16",
@@ -68,6 +69,7 @@ class WhisperModel(ABC):
         self.compute_type = compute_type
 
         self.n_mels = n_mels
+        self.align_n_mels = align_n_mels
         self.merge_chunks = merge_chunks
         self.max_speech_len = max_speech_len
 
@@ -95,7 +97,9 @@ class WhisperModel(ABC):
         self.max_initial_prompt_len = self.max_text_token_len // 2 - 1
 
         # Load Pre Processor
-        self.align_preprocessor = LogMelSpectogram(n_mels=80).to(self.device)
+        self.align_preprocessor = LogMelSpectogram(n_mels=self.align_n_mels).to(
+            self.device
+        )
         self.preprocessor = LogMelSpectogram(n_mels=self.n_mels).to(self.device)
 
         # Load Speech Segmenter
@@ -141,8 +145,9 @@ class WhisperModel(ABC):
         audio_files: list[str],
         lang_codes: list[str] | str | None = None,
         tasks: list[str] | str | None = None,
-        initial_prompts: list[str] | str | None = None,
+        initial_prompts: list[str | None] | str | None = None,
         batch_size: int = 8,
+        use_vad: bool = False,
     ) -> list[list[dict[str, Any]]]:
         lang_codes = fix_batch_param(lang_codes, "en", len(audio_files))
         tasks = fix_batch_param(tasks, "transcribe", len(audio_files))
@@ -152,26 +157,24 @@ class WhisperModel(ABC):
 
         pbar_pos = 0
         with tqdm(total=len(audio_files) * 100, desc=f"Transcribing") as pbar:
-            for (
-                signals,
-                prompts,
-                seq_len,
-                seg_metadata,
-                pbar_update,
-            ) in self.data_loader(
+            dataloader = self.data_loader(
                 audio_files,
                 lang_codes,
                 tasks,
                 initial_prompts,
                 batch_size=batch_size,
-                use_vad=False,
-            ):
-                mels, seq_len = self.preprocessor(signals, seq_len)
+                use_vad=use_vad,
+            )
+
+            for data in dataloader:
+                signals, prompts, seq_len, seg_metadata, pbar_update = data
+
+                mels, seq_lens = self.preprocessor(signals, seq_len)
                 align_mels, align_seq_lens = self.align_preprocessor(signals, seq_len)
                 res = self.generate_segment_batched(
                     mels.to(self.device),
                     prompts,
-                    seq_len,
+                    seq_lens,
                     seg_metadata,
                     align_features=align_mels.to(self.device),
                     align_seq_lens=align_seq_lens,
@@ -200,52 +203,14 @@ class WhisperModel(ABC):
         audio_files: list[str],
         lang_codes: list[str] | str | None = None,
         tasks: list[str] | str | None = None,
-        initial_prompts: list[str] | str | None = None,
+        initial_prompts: list[str | None] | str | None = None,
         batch_size: int = 8,
     ) -> list[list[dict[str, Any]]]:
-        lang_codes = fix_batch_param(lang_codes, "en", len(audio_files))
-        tasks = fix_batch_param(tasks, "transcribe", len(audio_files))
-        initial_prompts = fix_batch_param(initial_prompts, None, len(audio_files))
-
-        responses = [[] for _ in audio_files]
-
-        pbar_pos = 0
-        with tqdm(total=len(audio_files) * 100, desc=f"Transcribing") as pbar:
-            dataloader = self.data_loader(
-                audio_files,
-                lang_codes,
-                tasks,
-                initial_prompts,
-                batch_size=batch_size,
-            )
-
-            for data in dataloader:
-                signals, prompts, seq_len, seg_metadata, pbar_update = data
-
-                mels, seq_len = self.preprocessor(signals, seq_len)
-                align_mels, align_seq_lens = self.align_preprocessor(signals, seq_len)
-                res = self.generate_segment_batched(
-                    mels.to(self.device),
-                    prompts,
-                    seq_len,
-                    seg_metadata,
-                    align_features=align_mels.to(self.device),
-                    align_seq_lens=align_seq_lens,
-                )
-
-                for res_idx, _seg_metadata in enumerate(seg_metadata):
-                    responses[_seg_metadata["file_id"]].append(
-                        {
-                            **res[res_idx],
-                            "start_time": round(_seg_metadata["start_time"], 3),
-                            "end_time": round(_seg_metadata["end_time"], 3),
-                        }
-                    )
-
-                if (pbar_pos) <= pbar.total:
-                    pbar_pos += pbar_update
-                    pbar.update(pbar_update)
-
-            pbar.update(pbar.total - pbar_pos)
-
-        return responses
+        return self.transcribe(
+            audio_files,
+            lang_codes=lang_codes,
+            tasks=tasks,
+            initial_prompts=initial_prompts,
+            batch_size=batch_size,
+            use_vad=True,
+        )

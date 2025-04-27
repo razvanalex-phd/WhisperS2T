@@ -7,8 +7,8 @@ import tokenizers
 import torch
 
 from whisper_s2t.backends import WhisperModel
-from whisper_s2t.backends.ctranslate2.hf_utils import download_model
-from whisper_s2t.backends.ctranslate2.tokenizer import Tokenizer
+from whisper_s2t.backends.hf_utils import download_model
+from whisper_s2t.backends.tokenizer import Tokenizer
 from whisper_s2t.configs import *
 
 FAST_ASR_OPTIONS: dict[str, Any] = {
@@ -203,7 +203,6 @@ class WhisperModelCT2(WhisperModel):
         start_seq_wise_req = {}
         for _idx, _sot_seq in enumerate(sot_seqs):
             try:
-                # print(_sot_seq)
                 start_seq_wise_req[_sot_seq].append(_idx)
             except:
                 start_seq_wise_req[_sot_seq] = [_idx]

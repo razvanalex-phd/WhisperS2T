@@ -38,8 +38,12 @@ def load_model(
     model_kwargs = dict(**kwargs)
     identifier = model_identifier.lower()
 
-    if identifier in ["large-v3"]:
+    more_mels = ["large-v3", "turbo", "large-v3-turbo"]
+    if identifier in more_mels:
         model_kwargs["n_mels"] = 128
+    if kwargs.get("asr_options", {}).get("word_aligner_model") in more_mels:
+        model_kwargs["align_n_mels"] = 128
+
     elif (identifier in ["distil-large-v2"]) and (
         backend.lower() not in ["huggingface", "hf"]
     ):

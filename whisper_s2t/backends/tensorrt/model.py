@@ -7,14 +7,14 @@ import tokenizers
 import torch
 
 from whisper_s2t.backends import WhisperModel
+from whisper_s2t.backends.hf_utils import download_model
 from whisper_s2t.backends.tensorrt.engine_builder import (
     TRTBuilderConfig,
     build_trt_engine,
     load_trt_build_config,
 )
-from whisper_s2t.backends.tensorrt.hf_utils import download_model
-from whisper_s2t.backends.tensorrt.tokenizer import Tokenizer
 from whisper_s2t.backends.tensorrt.trt_model import WhisperTRT
+from whisper_s2t.backends.tokenizer import Tokenizer
 from whisper_s2t.configs import *
 
 FAST_ASR_OPTIONS: dict[str, Any] = {
@@ -229,7 +229,6 @@ class WhisperModelTRT(WhisperModel):
         start_seq_wise_req = {}
         for _idx, _sot_seq in enumerate(sot_seqs):
             try:
-                # print(_sot_seq)
                 start_seq_wise_req[_sot_seq].append(_idx)
             except:
                 start_seq_wise_req[_sot_seq] = [_idx]
