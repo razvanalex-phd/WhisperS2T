@@ -282,7 +282,9 @@ class WhisperModelTRT(WhisperModel):
         prompts: list[list[int]],
         seq_lens: torch.Tensor,
         seg_metadata: list[dict[str, Any]],
-        **kwargs: Any,
+        *,
+        align_features: torch.Tensor,
+        align_seq_lens: torch.Tensor,
     ) -> list[dict[str, Any]]:
         if self.compute_type == "float16":
             features = features.half()
@@ -306,11 +308,11 @@ class WhisperModelTRT(WhisperModel):
             ]
             sot_seqs = [tuple(_[-4:]) for _ in prompts]
             word_timings = self.align_words(
-                features,
+                align_features,
                 texts,
                 text_tokens,
                 sot_seqs,
-                seq_lens,
+                align_seq_lens,
                 seg_metadata,
             )
 

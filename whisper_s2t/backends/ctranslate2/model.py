@@ -256,8 +256,9 @@ class WhisperModelCT2(WhisperModel):
         prompts: list[list[int]],
         seq_lens: torch.Tensor,
         seg_metadata: list[dict[str, Any]],
-        *args: Any,
-        **kwargs: Any,
+        *,
+        align_features: torch.Tensor,
+        align_seq_lens: torch.Tensor,
     ) -> list[dict[str, Any]]:
 
         if self.device == "cpu" and isinstance(features, torch.Tensor):
@@ -293,11 +294,11 @@ class WhisperModelCT2(WhisperModel):
             text_tokens = [x.sequences_ids[0] + [self.tokenizer.eot] for x in result]
             sot_seqs = [tuple(_[-4:]) for _ in prompts]
             word_timings = self.align_words(
-                features,
+                align_features,
                 texts,
                 text_tokens,
                 sot_seqs,
-                seq_lens,
+                align_seq_lens,
                 seg_metadata,
             )
 

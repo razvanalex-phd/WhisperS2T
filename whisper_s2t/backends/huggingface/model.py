@@ -68,11 +68,11 @@ class WhisperModelHF(WhisperModel):
     def generate_segment_batched(
         self,
         features: torch.Tensor,
-        prompts: list[Any],
+        prompts: list[list[int]],
         seq_lens: torch.Tensor,
         seg_metadata: list[dict[str, Any]],
-        **kwargs,
-    ) -> list[dict]:
+        **kwargs: Any,
+    ) -> list[dict[str, Any]]:
         if self.compute_type == "float16":
             features = features.to(self.device).half()
 

@@ -126,13 +126,12 @@ class WhisperModel(ABC):
     def generate_segment_batched(
         self,
         features: torch.Tensor,
-        prompts: list[Any],
+        prompts: list[list[int]],
         seq_lens: torch.Tensor,
         seg_metadata: list[dict[str, Any]],
         *,
         align_features: torch.Tensor,
         align_seq_lens: torch.Tensor,
-        **kwargs: Any,
     ) -> list[dict[str, Any]]:
         raise NotImplemented()
 

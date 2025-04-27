@@ -60,7 +60,7 @@ class WhisperModelOAI(WhisperModel):
     def generate_segment_batched(
         self,
         features: torch.Tensor,
-        prompts: list[Any],
+        prompts: list[list[int]],
         *args: Any,
         **kwargs: Any,
     ) -> list[dict[str, Any]]:
