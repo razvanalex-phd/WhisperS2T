@@ -1,0 +1,17 @@
+{
+  "typeCheckingMode": "basic",
+  "include": [
+    "whisper_s2t",
+    "scripts",
+    "tools"
+  ],
+  "exclude": [
+    "**/__pycache__",
+    ".venv",
+    "build"
+  ],
+  "reportMissingImports": true,
+  "reportMissingTypeStubs": false,
+  "pythonVersion": "3.10",
+  "pythonPlatform": "Linux"
+}
