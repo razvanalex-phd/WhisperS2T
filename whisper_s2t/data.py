@@ -73,6 +73,8 @@ class BasicSegmenter:
         else:
             raise ValueError("Either input_file or audio_signal must be provided.")
 
+        audio_duration = max(1, audio_duration)
+
         start_ends: list[list[float]] = []
         for i in range(0, int(audio_duration), int(self.max_seg_len)):
             start_ends.append([i, i + self.max_seg_len])
